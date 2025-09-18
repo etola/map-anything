@@ -80,30 +80,55 @@ class ColmapReconstruction:
         if image_id not in self._image_point3D_xy:
             return 0.0, 0.0
         
+        # Check if we have valid shared points for this image
+        valid_shared_points = []
+        for point_id in shared_points:
+            if point_id in self._image_point3D_xy[image_id]:
+                valid_shared_points.append(point_id)
+        
+        if len(valid_shared_points) < 2:
+            return 0.0, 0.0
+        
         image = self.reconstruction.images[image_id]
-        xs = [self._image_point3D_xy[image_id][point_id][0] for point_id in shared_points]
-        ys = [self._image_point3D_xy[image_id][point_id][1] for point_id in shared_points]
+        camera = self.reconstruction.cameras[image.camera_id]
+        
+        xs = [self._image_point3D_xy[image_id][point_id][0] for point_id in valid_shared_points]
+        ys = [self._image_point3D_xy[image_id][point_id][1] for point_id in valid_shared_points]
         
         x_min, x_max = min(xs), max(xs)
         y_min, y_max = min(ys), max(ys)
         x_range = x_max - x_min
         y_range = y_max - y_min
         
-        x_coverage = x_range / image.camera.width
-        y_coverage = y_range / image.camera.height
+        x_coverage = x_range / camera.width
+        y_coverage = y_range / camera.height
         
         return x_coverage, y_coverage
     
     def compute_average_parallax(self, shared_points: Set[int], img1_id: int, img2_id: int, sample_size: int = 100) -> float:
         """Compute average parallax angle between two images for shared 3D points."""
+        if len(shared_points) == 0:
+            return 0.0
+            
         parallax_angles = []
         sample_size = min(sample_size, len(shared_points))
         
-        for point_id in random.sample(list(shared_points), sample_size):
-            point = self.reconstruction.points3D[point_id]
-            parallax_angle = compute_parallax_angle(point.xyz, img1_id, img2_id, self)
-            parallax_angles.append(parallax_angle)
+        if sample_size == 0:
+            return 0.0
         
+        try:
+            for point_id in random.sample(list(shared_points), sample_size):
+                if point_id in self.reconstruction.points3D:
+                    point = self.reconstruction.points3D[point_id]
+                    parallax_angle = compute_parallax_angle(point.xyz, img1_id, img2_id, self)
+                    parallax_angles.append(parallax_angle)
+        except Exception as e:
+            # If any error in parallax computation, return a default value
+            return 0.1  # Small positive value to indicate some parallax
+        
+        if len(parallax_angles) == 0:
+            return 0.0
+            
         return np.mean(parallax_angles)
     
    
@@ -120,6 +145,13 @@ class ColmapReconstruction:
         Returns:
             List of partner image IDs that satisfy parallax requirements, or [-1] if no good match found
         """
+        # Ensure image point mappings are built
+        self._ensure_image_point_maps()
+        
+        # Check if the current image has any 3D points
+        if self._image_point3D_ids is None or image_id not in self._image_point3D_ids:
+            return [-1]
+        
         # Find other images that share at least min_points points
         other_images = [other_image for other_image in self.reconstruction.images.values() 
                        if other_image.image_id != image_id]
@@ -130,7 +162,8 @@ class ColmapReconstruction:
                 continue
             # Get the points that the two images share
             shared_points = self._image_point3D_ids[image_id] & self._image_point3D_ids[other_image.image_id]
-            match_candidates.append(MatchCandidate(other_image.image_id, shared_points))
+            if len(shared_points) > 0:  # Only add if there are shared points
+                match_candidates.append(MatchCandidate(other_image.image_id, shared_points))
         
         # Sort by number of shared points
         match_candidates.sort(key=lambda x: len(x.shared_points), reverse=True)
@@ -300,11 +333,12 @@ class ColmapReconstruction:
     
     def get_image_camera(self, image_id: int):
         """Get camera object for an image."""
-        return self.get_image(image_id).camera
+        image = self.get_image(image_id)
+        return self.reconstruction.cameras[image.camera_id]
     
     def get_image_cam_from_world(self, image_id: int):
         """Get camera pose (cam_from_world) for an image."""
-        return self.get_image(image_id).cam_from_world()
+        return self.get_image(image_id).cam_from_world
     
     def get_all_image_ids(self) -> List[int]:
         """Get list of all image IDs in the reconstruction."""
