@@ -109,7 +109,7 @@ def parse_args():
     parser.add_argument(
         "--smart_batching",
         action="store_true",
-        default=True,
+        default=False,
         help="Use COLMAP reconstruction quality for intelligent batch formation (default: True)",
     )
     parser.add_argument(
@@ -462,25 +462,25 @@ def filter_images_with_reference_points(reconstruction, reference_reconstruction
             source_reconstruction=reconstruction,
             target_reconstruction=reference_reconstruction,
             source_image_id=img_id,
-            pose_tolerance_rotation=0.1,  # 0.1 radians ≈ 5.7 degrees
-            pose_tolerance_translation=0.1,  # 0.1 meters = 10 cm
+            pose_tolerance_rotation=1e-3,  # Very strict tolerance for identical poses
+            pose_tolerance_translation=1e-3,  # Very strict tolerance for identical poses
             verbose=False
         )
         
-        if match_result['match_found']:
+        if match_result['match_found'] and match_result['poses_compatible']:
             image_name_mapping[img_id] = match_result['target_image_id']
             matched_count += 1
-            if match_result['poses_compatible']:
-                compatible_count += 1
-                if verbose:
-                    print(f"  ✓ {match_result['image_name']}: Compatible match (ID: {img_id} → {match_result['target_image_id']}) via {match_result['match_method']}")
-            else:
-                if verbose:
-                    print(f"  ⚠ {match_result['image_name']}: Pose mismatch (ID: {img_id} → {match_result['target_image_id']}) via {match_result['match_method']} - {match_result['pose_status']}")
+            compatible_count += 1
+            if verbose:
+                print(f"  ✓ {match_result['image_name']}: Compatible match (ID: {img_id} → {match_result['target_image_id']}) via {match_result['match_method']}")
         else:
             image_name_mapping[img_id] = None
-            if verbose:
-                print(f"  ❌ {match_result['image_name'] or f'ID:{img_id}'}: No match found - {match_result['pose_status']}")
+            if match_result['match_found']:
+                if verbose:
+                    print(f"  ❌ {match_result['image_name']}: Pose mismatch (ID: {img_id} → {match_result['target_image_id']}) via {match_result['match_method']} - {match_result['pose_status']}")
+            else:
+                if verbose:
+                    print(f"  ❌ {match_result['image_name'] or f'ID:{img_id}'}: No match found - {match_result['pose_status']}")
     
     print(f"Matching Summary: {compatible_count}/{matched_count}/{len(image_ids)} (compatible/matched/total)")
     
@@ -501,7 +501,7 @@ def filter_images_with_reference_points(reconstruction, reference_reconstruction
             else:
                 print(f"  ❌ Excluding image {reconstruction.get_image_name(img_id)} (ID:{img_id}) - no reference points found")
         else:
-            print(f"  ❌ Excluding image {reconstruction.get_image_name(img_id)} (ID:{img_id}) - no match in reference reconstruction")
+            print(f"  ❌ Excluding image {reconstruction.get_image_name(img_id)} (ID:{img_id}) - no compatible match in reference reconstruction")
     
     print(f"\nFiltered to {len(valid_image_ids)}/{len(image_ids)} images with reference points")
     return valid_image_ids, image_name_mapping
@@ -605,6 +605,37 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
             # Collect depth range for consistent scaling
             if depth_range is not None:
                 all_depth_ranges.append(depth_range)
+            
+            # Compute and save point cloud from prior depth map for comparison
+            if prior_depth is not None and np.sum(prior_depth > 0) > 0:
+                print(f"Computing point cloud from prior depth map for {img_name}...")
+                
+                # Create a dummy image for color information
+                dummy_image = np.ones((target_size, target_size, 3), dtype=np.float32) * 0.5
+                
+                # Convert depth map to point cloud using ground truth parameters
+                # Convert cam_from_world to cam2world for the function
+                pose_4x4 = np.eye(4)
+                pose_4x4[:3, :] = pose_matrix
+                pose_4x4 = np.linalg.inv(pose_4x4)  # Convert cam_from_world to cam2world
+                
+                prior_points_from_depth, prior_colors_from_depth = compute_pointcloud_from_depthmap_groundtruth(
+                    prior_depth, dummy_image, K_scaled, pose_4x4,
+                    conf_threshold=0.0, max_points=None
+                )
+                
+                if len(prior_points_from_depth) > 0:
+                    print(f"Generated {len(prior_points_from_depth)} points from prior depth map")
+                    
+                    # Save the point cloud from prior depth map
+                    if output_folder is not None:
+                        save_single_pointcloud(prior_points_from_depth, prior_colors_from_depth, image_id, img_name, 
+                                             "prior_depth", output_folder)
+                        print(f"Saved prior depth point cloud for {img_name}")
+                else:
+                    print(f"Warning: No points generated from prior depth map for {img_name}")
+            else:
+                print(f"Warning: No valid prior depth map for {img_name}")
         
         view = {
             "img": images[view_idx][None],  # Add batch dimension
@@ -643,6 +674,8 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
             total_pixels = z_depth_tensor.numel()
             print(f"Added prior depth to view for image {image_id}: {valid_pixels}/{total_pixels} valid pixels")
             print(f"  Z-depth range: {z_depth_tensor[z_depth_tensor > 0].min():.3f} - {z_depth_tensor[z_depth_tensor > 0].max():.3f}" if valid_pixels > 0 else "  No valid depths")
+        else:
+            print(f"No prior depth computed for image {image_id}")
         views.append(view)
     
     # Summary of views being passed to model
@@ -734,22 +767,26 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
                 else:
                     print(f"Warning: No prior depth computed for {img_name} (Cal_ID:{image_id} → Ref_ID:{ref_image_id})")
         
-        # Save predicted depth maps
+        # Save predicted depth maps (only for images with reference points)
         for pred_idx, pred in enumerate(predictions):
             image_id = image_ids[pred_idx]
             img_name = reconstruction.get_image_name(image_id)
             pred_depth = pred["depth_z"][0].squeeze(-1).cpu().numpy()  # (H, W)
             
-            # Save colorized predicted depth map
-            save_path = os.path.join(depth_maps_folder, f"predicted_depth_{image_id}_{img_name}.png")
-            _, _ = colorize_depth_map(
-                pred_depth, 
-                colormap='plasma', 
-                save_path=save_path, 
-                depth_range=consistent_depth_range,
-                title_prefix=f"Predicted Depth Map ({img_name}) - Cal_ID:{image_id}"
-            )
-            print(f"Saved predicted depth map: {save_path}")
+            # Only save predicted depth maps for images that have reference points
+            if reference_reconstruction is None or (image_id in image_name_mapping and image_name_mapping[image_id] is not None):
+                # Save colorized predicted depth map
+                save_path = os.path.join(depth_maps_folder, f"predicted_depth_{image_id}_{img_name}.png")
+                _, _ = colorize_depth_map(
+                    pred_depth, 
+                    colormap='plasma', 
+                    save_path=save_path, 
+                    depth_range=consistent_depth_range,
+                    title_prefix=f"Predicted Depth Map ({img_name}) - Cal_ID:{image_id}"
+                )
+                print(f"Saved predicted depth map: {save_path}")
+            else:
+                print(f"Skipping predicted depth map for {img_name} (ID:{image_id}) - no reference points")
         
         print(f"Saved depth maps to {depth_maps_folder}")
     
@@ -1822,9 +1859,26 @@ def main():
     model = MapAnything.from_pretrained(model_name).to(device)
     model.eval()
     
-    # Get all image IDs and split into smart batches using COLMAP relationships
+    # Get all image IDs and filter to only include those with reference points
     all_image_ids = reconstruction.get_all_image_ids()
     print(f"Total images in reconstruction: {len(all_image_ids)}")
+    
+    # Filter images to only include those with reference points
+    if reference_reconstruction is not None:
+        print("\n=== Filtering Images with Reference Points ===")
+        valid_image_ids, global_image_name_mapping = filter_images_with_reference_points(
+            reconstruction, reference_reconstruction, all_image_ids, verbose=args.verbose
+        )
+        
+        if len(valid_image_ids) == 0:
+            print("❌ No valid images found with reference points. Cannot run inference.")
+            return
+        
+        print(f"\n📊 Global filtering: {len(valid_image_ids)}/{len(all_image_ids)} images with reference points")
+        print(f"🔍 DEBUG: Valid image IDs: {valid_image_ids[:10]}...")  # Show first 10
+        all_image_ids = valid_image_ids  # Use only valid images
+    else:
+        global_image_name_mapping = {}
     
     # Validate prior depthmaps only if explicitly requested
     if args.validate_prior_only:
@@ -1850,6 +1904,10 @@ def main():
     # Choose batching strategy
     use_smart_batching = args.smart_batching and not args.sequential_batching
     
+    print(f"🔍 DEBUG: About to batch {len(all_image_ids)} images")
+    print(f"🔍 DEBUG: First 5 image IDs: {all_image_ids[:5]}")
+    print(f"🔍 DEBUG: Expected 102 images with reference points")
+    
     if use_smart_batching:
         print("Using smart batching based on COLMAP reconstruction quality...")
         batches = split_into_batches_smart(reconstruction, all_image_ids, args.batch_size)
@@ -1859,41 +1917,35 @@ def main():
         batches = split_into_batches(all_image_ids, args.batch_size)
         print(f"Processing {len(batches)} sequential batches with batch size {args.batch_size}")
     
+    # Debug: Print total images to be processed
+    total_images_to_process = sum(len(batch) for batch in batches)
+    print(f"🔍 DEBUG: Total images to be processed: {total_images_to_process}")
+    print(f"🔍 DEBUG: All image IDs length: {len(all_image_ids)}")
+    if reference_reconstruction is not None:
+        print(f"🔍 DEBUG: Images with reference points: {len(all_image_ids)} (after filtering)")
+    
     try:
         batch_files = []
         
         # Process each batch
         for batch_idx, batch_image_ids in enumerate(batches):
             print(f"\n--- Processing batch {batch_idx + 1}/{len(batches)} ---")
+            print(f"🔍 DEBUG: Batch {batch_idx + 1} has {len(batch_image_ids)} images")
             
-            # Filter images to only include those with reference points
-            if reference_reconstruction is not None:
-                valid_batch_image_ids, batch_image_name_mapping = filter_images_with_reference_points(
-                    reconstruction, reference_reconstruction, batch_image_ids, verbose=args.verbose
-                )
-                
-                if len(valid_batch_image_ids) == 0:
-                    print(f"  ⚠️  No valid images in batch {batch_idx + 1} - skipping")
-                    continue
-                
-                print(f"  📊 Batch {batch_idx + 1}: {len(valid_batch_image_ids)}/{len(batch_image_ids)} images with reference points")
-            else:
-                valid_batch_image_ids = batch_image_ids
-                batch_image_name_mapping = {}
-            
-            # Load images for this batch (only valid images)
+            # Load images for this batch (all images are already filtered)
             batch_images, batch_image_ids_loaded, _ = load_images_from_colmap(
                 reconstruction, images_dir, args.resolution, 
-                model.encoder.data_norm_type, valid_batch_image_ids
+                model.encoder.data_norm_type, batch_image_ids
             )
             batch_images = batch_images.to(device)
+            print(f"🔍 DEBUG: Loaded {len(batch_image_ids_loaded)} images for batch {batch_idx + 1}")
             
             # Run model inference on batch
             with torch.no_grad():
                 batch_predictions = run_mapanything_inference(
                     model, batch_images, reconstruction, batch_image_ids_loaded, 
                     args.resolution, dtype, args.memory_efficient_inference, reference_reconstruction,
-                    args.verbose, args.output_folder, batch_image_name_mapping
+                    args.verbose, args.output_folder, global_image_name_mapping
                 )
             
             # Extract point cloud from batch predictions using ground truth parameters
