@@ -285,59 +285,59 @@ def project_3d_points_to_depth(points_3d, intrinsics, cam_from_world, target_siz
     return depth_map
 
 
-def colorize_depth_map(depth_map, colormap='plasma', save_path=None, depth_range=None, title_prefix="Depth Map"):
+def colorize_heatmap(data_map, colormap='plasma', save_path=None, data_range=None, title_prefix="Heatmap"):
     """
-    Colorize a depth map for visualization and optionally save it.
+    Colorize a data map (depth, confidence, etc.) for visualization and optionally save it.
     
     Args:
-        depth_map: (H, W) numpy array with depth values
+        data_map: (H, W) numpy array with data values
         colormap: matplotlib colormap name (default: 'plasma')
         save_path: optional path to save the colorized image
-        depth_range: optional tuple (min_depth, max_depth) for consistent scaling across multiple maps
-        title_prefix: prefix for the plot title (default: "Depth Map")
+        data_range: optional tuple (min_value, max_value) for consistent scaling across multiple maps
+        title_prefix: prefix for the plot title (default: "Heatmap")
         
     Returns:
-        colorized_image: (H, W, 3) RGB array of colorized depth map
-        actual_depth_range: tuple (min_depth, max_depth) of actual depth range used
+        colorized_image: (H, W, 3) RGB array of colorized data map
+        actual_data_range: tuple (min_value, max_value) of actual data range used
     """
-    # Handle case where depth map is all zeros
-    if np.max(depth_map) == 0:
-        # Create a black image for zero depth
-        colorized = np.zeros((depth_map.shape[0], depth_map.shape[1], 3), dtype=np.uint8)
+    # Handle case where data map is all zeros
+    if np.max(data_map) == 0:
+        # Create a black image for zero values
+        colorized = np.zeros((data_map.shape[0], data_map.shape[1], 3), dtype=np.uint8)
         if save_path:
             Image.fromarray(colorized).save(save_path)
         return colorized, (0.0, 0.0)
     
-    # Determine depth range for normalization
-    valid_mask = depth_map > 0
+    # Determine data range for normalization
+    valid_mask = data_map > 0
     if np.any(valid_mask):
-        actual_min_depth = np.min(depth_map[valid_mask])
-        actual_max_depth = np.max(depth_map[valid_mask])
+        actual_min_value = np.min(data_map[valid_mask])
+        actual_max_value = np.max(data_map[valid_mask])
         
-        # Use provided depth range if available, otherwise use actual range
-        if depth_range is not None:
-            min_depth, max_depth = depth_range
+        # Use provided data range if available, otherwise use actual range
+        if data_range is not None:
+            min_value, max_value = data_range
             # Ensure the provided range encompasses the actual data
-            min_depth = min(min_depth, actual_min_depth)
-            max_depth = max(max_depth, actual_max_depth)
+            min_value = min(min_value, actual_min_value)
+            max_value = max(max_value, actual_max_value)
         else:
-            min_depth, max_depth = actual_min_depth, actual_max_depth
+            min_value, max_value = actual_min_value, actual_max_value
         
-        # Create normalized depth map
-        normalized_depth = np.zeros_like(depth_map)
-        if max_depth > min_depth:
-            normalized_depth[valid_mask] = np.clip((depth_map[valid_mask] - min_depth) / (max_depth - min_depth), 0, 1)
+        # Create normalized data map
+        normalized_data = np.zeros_like(data_map)
+        if max_value > min_value:
+            normalized_data[valid_mask] = np.clip((data_map[valid_mask] - min_value) / (max_value - min_value), 0, 1)
         else:
-            normalized_depth[valid_mask] = 1.0
+            normalized_data[valid_mask] = 1.0
             
-        actual_range = (min_depth, max_depth)
+        actual_range = (min_value, max_value)
     else:
-        normalized_depth = np.zeros_like(depth_map)
+        normalized_data = np.zeros_like(data_map)
         actual_range = (0.0, 0.0)
     
     # Apply colormap
     cmap = cm.get_cmap(colormap)
-    colorized = cmap(normalized_depth)
+    colorized = cmap(normalized_data)
     
     # Set invalid pixels to black
     colorized[~valid_mask] = [0, 0, 0, 1]
@@ -350,13 +350,13 @@ def colorize_depth_map(depth_map, colormap='plasma', save_path=None, depth_range
         # Create figure with depth information
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
         
-        # Original depth map
-        im1 = ax1.imshow(depth_map, cmap='gray', vmin=actual_range[0], vmax=actual_range[1])
-        ax1.set_title(f'{title_prefix} (Raw)\nMin: {actual_range[0]:.2f}m, Max: {actual_range[1]:.2f}m' if np.any(valid_mask) else f'{title_prefix} (Raw)\nNo valid depths')
+        # Original data map
+        im1 = ax1.imshow(data_map, cmap='gray', vmin=actual_range[0], vmax=actual_range[1])
+        ax1.set_title(f'{title_prefix} (Raw)\nMin: {actual_range[0]:.2f}, Max: {actual_range[1]:.2f}' if np.any(valid_mask) else f'{title_prefix} (Raw)\nNo valid values')
         ax1.axis('off')
         plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
         
-        # Colorized depth map
+        # Colorized data map
         ax2.imshow(colorized_rgb)
         ax2.set_title(f'{title_prefix} (Colorized)\n{np.sum(valid_mask)} valid pixels')
         ax2.axis('off')
@@ -365,7 +365,7 @@ def colorize_depth_map(depth_map, colormap='plasma', save_path=None, depth_range
         plt.savefig(save_path, dpi=150, bbox_inches='tight')
         plt.close()
         
-        print(f"Saved colorized depth map to: {save_path}")
+        print(f"Saved colorized heatmap to: {save_path}")
     
     return colorized_rgb, actual_range
 
@@ -626,11 +626,10 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
                 
                 if len(prior_points_from_depth) > 0:
                     print(f"Generated {len(prior_points_from_depth)} points from prior depth map")
-                    
                     # Save the point cloud from prior depth map
-                    if output_folder is not None:
+                    if output_folder is not None and verbose:
                         save_single_pointcloud(prior_points_from_depth, prior_colors_from_depth, image_id, img_name, 
-                                             "prior_depth", output_folder)
+                                             "depth_prior", output_folder)
                         print(f"Saved prior depth point cloud for {img_name}")
                 else:
                     print(f"Warning: No points generated from prior depth map for {img_name}")
@@ -756,11 +755,11 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
                 if prior_depth is not None:
                     # Save with consistent scaling (use calibration image_id for filename)
                     save_path = os.path.join(depth_maps_folder, f"prior_depth_{image_id}_{img_name}.png")
-                    _, _ = colorize_depth_map(
+                    _, _ = colorize_heatmap(
                         prior_depth, 
                         colormap='plasma', 
                         save_path=save_path, 
-                        depth_range=consistent_depth_range,
+                        data_range=consistent_depth_range,
                         title_prefix=f"Prior Depth Map ({img_name}) - Cal_ID:{image_id} → Ref_ID:{ref_image_id}"
                     )
                     print(f"Saved prior depth map: {save_path}")
@@ -777,14 +776,26 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
             if reference_reconstruction is None or (image_id in image_name_mapping and image_name_mapping[image_id] is not None):
                 # Save colorized predicted depth map
                 save_path = os.path.join(depth_maps_folder, f"predicted_depth_{image_id}_{img_name}.png")
-                _, _ = colorize_depth_map(
+                _, _ = colorize_heatmap(
                     pred_depth, 
                     colormap='plasma', 
                     save_path=save_path, 
-                    depth_range=consistent_depth_range,
+                    data_range=consistent_depth_range,
                     title_prefix=f"Predicted Depth Map ({img_name}) - Cal_ID:{image_id}"
                 )
                 print(f"Saved predicted depth map: {save_path}")
+                
+                # Save colorized confidence map
+                pred_confidence = pred["conf"][0].squeeze(-1).cpu().numpy()  # (H, W)
+                conf_save_path = os.path.join(depth_maps_folder, f"predicted_confidence_{image_id}_{img_name}.png")
+                _, _ = colorize_heatmap(
+                    pred_confidence, 
+                    colormap='viridis', 
+                    save_path=conf_save_path, 
+                    data_range=None,  # Use automatic range for confidence (0-1)
+                    title_prefix=f"Predicted Confidence Map ({img_name}) - Cal_ID:{image_id}"
+                )
+                print(f"Saved predicted confidence map: {conf_save_path}")
             else:
                 print(f"Skipping predicted depth map for {img_name} (ID:{image_id}) - no reference points")
         
@@ -1072,6 +1083,263 @@ def save_single_pointcloud(points, colors, image_id, img_name, pc_type, output_f
     pc.export(pc_path)
     print(f"Saved {pc_type} point cloud: {pc_path} ({len(points)} points)")
     return pc_path
+
+
+def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder, device, target_size):
+    """
+    Save predicted depth maps as NPZ files for later post-processing.
+    
+    Args:
+        predictions: List of prediction dictionaries from model inference
+        reconstruction: ColmapReconstruction object
+        image_ids: List of image IDs corresponding to predictions
+        output_folder: Output directory for saving files
+        device: Device for tensor operations
+    """
+    print("Saving predicted depth maps as NPZ files...")
+    
+    # Create depth maps directory
+    depth_maps_dir = os.path.join(output_folder, "depth_maps")
+    os.makedirs(depth_maps_dir, exist_ok=True)
+    
+    for i, (prediction, image_id) in enumerate(zip(predictions, image_ids)):
+        if prediction is None:
+            continue
+            
+        # Get image name
+        image_name = reconstruction.get_image_name(image_id)
+        safe_name = image_name.replace('.jpg', '').replace('.png', '').replace('.jpeg', '')
+        
+        # Extract depth map and confidence
+        depth_map = prediction['depth_z'].cpu().numpy()  # (H, W)
+        confidence_map = prediction['conf'].cpu().numpy()  # (H, W)
+        
+        # Get camera parameters for this image
+        K = reconstruction.get_camera_calibration_matrix(image_id)  # (3, 3)
+        
+        # Get camera pose (world to camera transformation)
+        cam_from_world = reconstruction.get_image_cam_from_world(image_id)
+        pose_matrix = cam_from_world.matrix()  # 3x4 transformation matrix
+        
+        # Convert to 4x4 homogeneous matrix
+        pose_4x4 = np.eye(4)
+        pose_4x4[:3, :] = pose_matrix
+        
+        # Convert from cam_from_world to cam2world (world_from_cam) for consistency
+        pose_4x4 = np.linalg.inv(pose_4x4)
+        
+        # Scale intrinsics to match the image scaling used during depth computation
+        # Get original image dimensions
+        camera = reconstruction.get_image_camera(image_id)
+        original_width = camera.width
+        original_height = camera.height
+        
+        # Use the target size passed as parameter
+        
+        # Compute scaling factors
+        scale_x = target_size / original_width
+        scale_y = target_size / original_height
+        
+        # Scale intrinsics
+        K_scaled = K.copy()
+        K_scaled[0, :] *= scale_x  # Scale fx and cx
+        K_scaled[1, :] *= scale_y  # Scale fy and cy
+        
+        # Create filename
+        filename = f"depth_{image_id}_{safe_name}.npz"
+        filepath = os.path.join(depth_maps_dir, filename)
+        
+        # Save as NPZ file
+        np.savez_compressed(
+            filepath,
+            depth_map=depth_map,
+            confidence_map=confidence_map,
+            camera_intrinsics=K_scaled,  # Use scaled intrinsics
+            camera_pose=pose_4x4,  # Use 4x4 cam2world pose matrix
+            image_id=image_id,
+            image_name=image_name,
+            original_intrinsics=K  # Also save original intrinsics for reference
+        )
+        
+        print(f"Saved depth map: {filepath}")
+    
+    print(f"Saved {len([p for p in predictions if p is not None])} depth maps to {depth_maps_dir}")
+
+
+def load_npz_and_generate_pointcloud(npz_filepath, conf_threshold=0.0, max_points=None):
+    """
+    Load a depth map from NPZ file and generate a point cloud.
+    
+    Args:
+        npz_filepath: Path to the NPZ file containing depth map and camera parameters
+        conf_threshold: Confidence threshold for filtering points (default: 0.0)
+        max_points: Maximum number of points to keep (None for no limit)
+        
+    Returns:
+        tuple: (points_3d, colors, metadata) - numpy arrays and metadata dict
+    """
+    print(f"Loading depth map from: {npz_filepath}")
+    
+    # Load NPZ file
+    data = np.load(npz_filepath)
+    
+    # Extract data
+    depth_map = data['depth_map']  # (H, W) or (1, H, W, 1)
+    confidence_map = data['confidence_map']  # (H, W) or (1, H, W, 1)
+    camera_intrinsics = data['camera_intrinsics']  # (3, 3) - scaled intrinsics
+    camera_pose = data['camera_pose']  # (4, 4) - cam2world pose
+    image_id = data['image_id']
+    image_name = data['image_name']
+    
+    # Squeeze extra dimensions if present
+    if depth_map.ndim == 4:
+        depth_map = depth_map.squeeze(0).squeeze(-1)  # Remove batch and channel dims
+    if confidence_map.ndim == 4:
+        confidence_map = confidence_map.squeeze(0).squeeze(-1)  # Remove batch and channel dims
+    
+    print(f"Loaded depth map for {image_name} (ID: {image_id})")
+    print(f"Depth map shape: {depth_map.shape}")
+    print(f"Depth range: {np.min(depth_map[depth_map > 0]):.3f} - {np.max(depth_map[depth_map > 0]):.3f}")
+    print(f"Confidence range: {np.min(confidence_map):.3f} - {np.max(confidence_map):.3f}")
+    
+    # Filter by confidence threshold
+    if conf_threshold > 0.0:
+        valid_mask = confidence_map >= conf_threshold
+        depth_map_filtered = depth_map.copy()
+        depth_map_filtered[~valid_mask] = 0
+        print(f"Filtered by confidence >= {conf_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map.shape)} pixels")
+    else:
+        depth_map_filtered = depth_map
+    
+    # Check if we have valid depth values
+    if np.max(depth_map_filtered) == 0:
+        print("Warning: No valid depth values after filtering")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+    
+    # Convert to torch tensors
+    depthmap_torch = torch.tensor(depth_map_filtered, dtype=torch.float32)
+    intrinsics_torch = torch.tensor(camera_intrinsics, dtype=torch.float32)
+    pose_torch = torch.tensor(camera_pose, dtype=torch.float32)
+    
+    # Compute 3D points from depth using the saved camera parameters
+    result = depthmap_to_world_frame(
+        depthmap_torch, intrinsics_torch, pose_torch
+    )
+    
+    # Handle different return formats
+    if len(result) == 2:
+        pts3d, valid_mask = result
+    else:
+        print(f"Warning: depthmap_to_world_frame returned {len(result)} values, expected 2")
+        pts3d, valid_mask = result[0], result[1]
+    
+    # Convert to numpy
+    pts3d_np = pts3d.cpu().numpy()
+    valid_mask_np = valid_mask.cpu().numpy()
+    
+    # Extract valid points
+    if valid_mask_np.any():
+        valid_pts = pts3d_np[valid_mask_np]
+        
+        # Create dummy colors (you could load actual image colors if needed)
+        colors = np.ones((len(valid_pts), 3), dtype=np.float32) * 0.5  # Gray color
+        
+        # Subsample if max_points is specified
+        if max_points is not None and len(valid_pts) > max_points:
+            print(f"Subsampling from {len(valid_pts)} to {max_points} points...")
+            indices = np.random.choice(len(valid_pts), max_points, replace=False)
+            valid_pts = valid_pts[indices]
+            colors = colors[indices]
+        
+        print(f"Generated point cloud with {len(valid_pts)} points")
+        
+        # Prepare metadata
+        metadata = {
+            'image_id': int(image_id),
+            'image_name': str(image_name),
+            'depth_range': (float(np.min(depth_map[depth_map > 0])), float(np.max(depth_map[depth_map > 0]))),
+            'confidence_range': (float(np.min(confidence_map)), float(np.max(confidence_map))),
+            'camera_intrinsics': camera_intrinsics,
+            'camera_pose': camera_pose,
+            'conf_threshold': conf_threshold,
+            'max_points': max_points
+        }
+        
+        return valid_pts, colors, metadata
+    else:
+        print("Warning: No valid points found in depth map")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+
+
+def load_multiple_npz_and_generate_pointclouds(npz_folder, conf_threshold=0.0, max_points_per_file=None, max_total_points=None):
+    """
+    Load multiple NPZ files from a folder and generate point clouds.
+    
+    Args:
+        npz_folder: Path to folder containing NPZ files
+        conf_threshold: Confidence threshold for filtering points (default: 0.0)
+        max_points_per_file: Maximum points per file (None for no limit)
+        max_total_points: Maximum total points across all files (None for no limit)
+        
+    Returns:
+        tuple: (all_points, all_colors, metadata_list) - combined point clouds and metadata
+    """
+    import glob
+    
+    print(f"Loading NPZ files from: {npz_folder}")
+    
+    # Find all NPZ files
+    npz_files = glob.glob(os.path.join(npz_folder, "*.npz"))
+    if not npz_files:
+        print(f"No NPZ files found in {npz_folder}")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), []
+    
+    print(f"Found {len(npz_files)} NPZ files")
+    
+    all_points = []
+    all_colors = []
+    metadata_list = []
+    
+    for i, npz_file in enumerate(npz_files):
+        print(f"\nProcessing file {i+1}/{len(npz_files)}: {os.path.basename(npz_file)}")
+        
+        try:
+            points, colors, metadata = load_npz_and_generate_pointcloud(
+                npz_file, conf_threshold=conf_threshold, max_points=max_points_per_file
+            )
+            
+            if len(points) > 0:
+                all_points.append(points)
+                all_colors.append(colors)
+                metadata_list.append(metadata)
+                print(f"Added {len(points)} points from {metadata['image_name']}")
+            else:
+                print(f"Skipped {os.path.basename(npz_file)} - no valid points")
+                
+        except Exception as e:
+            print(f"Error processing {npz_file}: {e}")
+            continue
+    
+    if not all_points:
+        print("No valid point clouds generated from any NPZ files")
+        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), []
+    
+    # Combine all point clouds
+    combined_points = np.vstack(all_points)
+    combined_colors = np.vstack(all_colors)
+    
+    print(f"\nCombined point cloud: {len(combined_points)} points from {len(all_points)} files")
+    
+    # Apply total point limit if specified
+    if max_total_points is not None and len(combined_points) > max_total_points:
+        print(f"Subsampling from {len(combined_points)} to {max_total_points} total points...")
+        indices = np.random.choice(len(combined_points), max_total_points, replace=False)
+        combined_points = combined_points[indices]
+        combined_colors = combined_colors[indices]
+    
+    print(f"Final point cloud: {len(combined_points)} points")
+    
+    return combined_points, combined_colors, metadata_list
 
 
 def process_single_image_pointclouds(pred, image_id, reconstruction, reference_reconstruction, 
@@ -1810,6 +2078,8 @@ def main():
     # Set output folder
     if args.output_folder is None:
         args.output_folder = os.path.join(args.scene_folder, "output")
+    else:
+        args.output_folder = os.path.join(args.scene_folder, args.output_folder)
     
     # Create output folder
     os.makedirs(args.output_folder, exist_ok=True)
@@ -1947,49 +2217,86 @@ def main():
                     args.resolution, dtype, args.memory_efficient_inference, reference_reconstruction,
                     args.verbose, args.output_folder, global_image_name_mapping
                 )
-            
-            # Extract point cloud from batch predictions using ground truth parameters
-            batch_points_3d, batch_colors = extract_point_cloud_from_predictions(
+
+            # Save predicted depth maps as NPZ files for later post-processing
+            save_depth_maps_as_npz(
                 batch_predictions, reconstruction, batch_image_ids_loaded, 
-                args.conf_threshold, args.max_points // len(batches), use_groundtruth=True, device=device
+                args.output_folder, device=device, target_size=args.resolution
             )
-            
-            # Save batch point cloud
-            if len(batch_points_3d) > 0:
-                batch_file = save_batch_pointcloud(
-                    batch_points_3d, batch_colors, batch_idx, args.output_folder
+
+            if args.verbose:
+
+                # Extract point cloud from batch predictions using ground truth parameters
+                batch_points_3d, batch_colors = extract_point_cloud_from_predictions(
+                    batch_predictions, reconstruction, batch_image_ids_loaded, 
+                    args.conf_threshold, args.max_points, use_groundtruth=True, device=device
                 )
-                batch_files.append(batch_file)
-            else:
-                print(f"Warning: Batch {batch_idx} produced no points")
-                batch_files.append(None)
+          
+                # Save batch point cloud
+                if len(batch_points_3d) > 0:
+                    batch_file = save_batch_pointcloud(
+                        batch_points_3d, batch_colors, batch_idx, args.output_folder
+                    )
+                    batch_files.append(batch_file)
+                else:
+                    print(f"Warning: Batch {batch_idx} produced no points")
+                    batch_files.append(None)
             
-            # Save individual prior and predicted point clouds for each image in the batch
-            if args.verbose and args.output_folder is not None:
-                save_individual_pointclouds(
-                    batch_predictions, batch_image_ids_loaded, reconstruction, 
-                    reference_reconstruction, args.output_folder, args.max_points, device
-                )
+                # Save individual prior and predicted point clouds for each image in the batch
+                if args.verbose and args.output_folder is not None:
+                    save_individual_pointclouds(
+                        batch_predictions, batch_image_ids_loaded, reconstruction, 
+                        reference_reconstruction, args.output_folder, args.max_points, device
+                    )
             
             # Clear GPU memory
             del batch_images, batch_predictions, batch_points_3d, batch_colors
             torch.cuda.empty_cache()
+
+        if args.verbose:
+            # Filter out None batch files
+            valid_batch_files = [f for f in batch_files if f is not None]
+            if len(valid_batch_files) == 0:
+                print("Error: No valid point clouds generated from any batch. Try lowering the confidence threshold.")
+                return
+            # Merge all batch point clouds
+            print(f"\n--- Merging {len(valid_batch_files)} batch point clouds ---")
+            total_points = merge_pointclouds_with_open3d(
+                valid_batch_files, final_pointcloud_path, args.max_points
+            )
+            
+            print(f"Successfully created final point cloud with {total_points} points at {final_pointcloud_path}")
+
+        # Generate point cloud from NPZ files for verification
+        print("\n=== Generating Point Cloud from NPZ Files for Verification ===")
+        depth_maps_folder = os.path.join(args.output_folder, "depth_maps")
         
-        # Filter out None batch files
-        valid_batch_files = [f for f in batch_files if f is not None]
-        
-        if len(valid_batch_files) == 0:
-            print("Error: No valid point clouds generated from any batch. Try lowering the confidence threshold.")
-            return
-        
-        # Merge all batch point clouds
-        print(f"\n--- Merging {len(valid_batch_files)} batch point clouds ---")
-        total_points = merge_pointclouds_with_open3d(
-            valid_batch_files, final_pointcloud_path, args.max_points
-        )
-        
-        print(f"Successfully created final point cloud with {total_points} points at {final_pointcloud_path}")
-        
+        if os.path.exists(depth_maps_folder):
+            print(f"Loading NPZ files from: {depth_maps_folder}")
+            
+            # Load all NPZ files and generate point cloud
+            npz_points, npz_colors, npz_metadata = load_multiple_npz_and_generate_pointclouds(
+                depth_maps_folder, 
+                conf_threshold=0.0,  # No confidence filtering for verification
+                max_points_per_file=100000,  # Limit per file to avoid memory issues
+                max_total_points=10000000  # Total limit
+            )
+            
+            if len(npz_points) > 0:
+                # Save NPZ-generated point cloud
+                npz_cloud_path = os.path.join(args.output_folder, "npz_cloud.ply")
+                
+                # Create point cloud using trimesh
+                npz_pc = trimesh.PointCloud(vertices=npz_points, colors=(npz_colors * 255).astype(np.uint8))
+                npz_pc.export(npz_cloud_path)
+                
+                print(f"✅ Saved NPZ-generated point cloud: {npz_cloud_path} ({len(npz_points)} points)")
+                print(f"   Generated from {len(npz_metadata)} NPZ files")
+            else:
+                print("❌ No valid point clouds generated from NPZ files")
+        else:
+            print(f"❌ Depth maps folder not found: {depth_maps_folder}")
+
     finally:
         print("Processing complete!")
 
