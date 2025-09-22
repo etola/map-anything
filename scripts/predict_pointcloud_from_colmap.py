@@ -551,6 +551,9 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
     # Keep track of depth ranges for consistent scaling
     all_depth_ranges = []
     
+    # Keep track of prior depths for each view
+    all_prior_depths = []
+    
     # Prepare views for model
     views = []
     for view_idx in range(images.shape[0]):
@@ -605,6 +608,9 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
             # Collect depth range for consistent scaling
             if depth_range is not None:
                 all_depth_ranges.append(depth_range)
+            
+            # Store prior depth for this view
+            all_prior_depths.append(prior_depth)
             
             # Compute and save point cloud from prior depth map for comparison
             if prior_depth is not None and np.sum(prior_depth > 0) > 0:
@@ -675,6 +681,8 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
             print(f"  Z-depth range: {z_depth_tensor[z_depth_tensor > 0].min():.3f} - {z_depth_tensor[z_depth_tensor > 0].max():.3f}" if valid_pixels > 0 else "  No valid depths")
         else:
             print(f"No prior depth computed for image {image_id}")
+            # Add None for this view since no prior depth was computed
+            all_prior_depths.append(None)
         views.append(view)
     
     # Summary of views being passed to model
@@ -801,7 +809,7 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
         
         print(f"Saved depth maps to {depth_maps_folder}")
     
-    return predictions
+    return predictions, all_prior_depths
 
 
 def compute_pointcloud_from_depthmap_groundtruth(depthmap, image, groundtruth_intrinsics, groundtruth_pose, conf_threshold=0.0, max_points=None):
@@ -1085,9 +1093,10 @@ def save_single_pointcloud(points, colors, image_id, img_name, pc_type, output_f
     return pc_path
 
 
-def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder, device, target_size):
+def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder, device, target_size, prior_depths=None):
     """
     Save predicted depth maps as NPZ files for later post-processing.
+    Overwrites predicted depths with prior depths where they are valid.
     
     Args:
         predictions: List of prediction dictionaries from model inference
@@ -1095,6 +1104,8 @@ def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder
         image_ids: List of image IDs corresponding to predictions
         output_folder: Output directory for saving files
         device: Device for tensor operations
+        target_size: Target image size used for preprocessing (e.g., args.resolution)
+        prior_depths: Optional list of prior depth maps corresponding to predictions
     """
     print("Saving predicted depth maps as NPZ files...")
     
@@ -1111,8 +1122,32 @@ def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder
         safe_name = image_name.replace('.jpg', '').replace('.png', '').replace('.jpeg', '')
         
         # Extract depth map and confidence
-        depth_map = prediction['depth_z'].cpu().numpy()  # (H, W)
-        confidence_map = prediction['conf'].cpu().numpy()  # (H, W)
+        depth_map = prediction['depth_z'].cpu().numpy()  # (H, W) or (1, H, W, 1)
+        confidence_map = prediction['conf'].cpu().numpy()  # (H, W) or (1, H, W, 1)
+        
+        # Squeeze extra dimensions if present
+        if depth_map.ndim == 4:
+            depth_map = depth_map.squeeze(0).squeeze(-1)  # Remove batch and channel dims
+        if confidence_map.ndim == 4:
+            confidence_map = confidence_map.squeeze(0).squeeze(-1)  # Remove batch and channel dims
+        
+        # Print confidence map statistics
+        conf_min = np.min(confidence_map)
+        conf_max = np.max(confidence_map)
+        conf_median = np.median(confidence_map)
+        conf_mean = np.mean(confidence_map)
+        print(f"Confidence map stats for {image_name}: min={conf_min:.3f}, max={conf_max:.3f}, median={conf_median:.3f}, mean={conf_mean:.3f}")
+        
+        # Store prior depth map separately (don't override predicted depths)
+        prior_depth_map = None
+        if prior_depths is not None and i < len(prior_depths) and prior_depths[i] is not None:
+            prior_depth_map = prior_depths[i]
+            if prior_depth_map.shape == depth_map.shape:
+                valid_prior_pixels = np.sum(prior_depth_map > 0)
+                print(f"Found {valid_prior_pixels} valid prior depth pixels for {image_name}")
+            else:
+                print(f"Warning: Prior depth shape {prior_depth_map.shape} doesn't match predicted depth shape {depth_map.shape} for {image_name}")
+                prior_depth_map = None
         
         # Get camera parameters for this image
         K = reconstruction.get_camera_calibration_matrix(image_id)  # (3, 3)
@@ -1149,17 +1184,24 @@ def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder
         filename = f"depth_{image_id}_{safe_name}.npz"
         filepath = os.path.join(depth_maps_dir, filename)
         
+        # Prepare data to save
+        save_data = {
+            'depth_map': depth_map,
+            'confidence_map': confidence_map,
+            'camera_intrinsics': K_scaled,  # Use scaled intrinsics
+            'camera_pose': pose_4x4,  # Use 4x4 cam2world pose matrix
+            'image_id': image_id,
+            'image_name': image_name,
+            'original_intrinsics': K  # Also save original intrinsics for reference
+        }
+        
+        # Add prior depth map if available
+        if prior_depth_map is not None:
+            save_data['prior_depth_map'] = prior_depth_map
+            print(f"  Added prior depth map to NPZ file for {image_name}")
+        
         # Save as NPZ file
-        np.savez_compressed(
-            filepath,
-            depth_map=depth_map,
-            confidence_map=confidence_map,
-            camera_intrinsics=K_scaled,  # Use scaled intrinsics
-            camera_pose=pose_4x4,  # Use 4x4 cam2world pose matrix
-            image_id=image_id,
-            image_name=image_name,
-            original_intrinsics=K  # Also save original intrinsics for reference
-        )
+        np.savez_compressed(filepath, **save_data)
         
         print(f"Saved depth map: {filepath}")
     
@@ -2212,7 +2254,7 @@ def main():
             
             # Run model inference on batch
             with torch.no_grad():
-                batch_predictions = run_mapanything_inference(
+                batch_predictions, batch_prior_depths = run_mapanything_inference(
                     model, batch_images, reconstruction, batch_image_ids_loaded, 
                     args.resolution, dtype, args.memory_efficient_inference, reference_reconstruction,
                     args.verbose, args.output_folder, global_image_name_mapping
@@ -2221,7 +2263,7 @@ def main():
             # Save predicted depth maps as NPZ files for later post-processing
             save_depth_maps_as_npz(
                 batch_predictions, reconstruction, batch_image_ids_loaded, 
-                args.output_folder, device=device, target_size=args.resolution
+                args.output_folder, device=device, target_size=args.resolution, prior_depths=batch_prior_depths
             )
 
             if args.verbose:
@@ -2249,8 +2291,10 @@ def main():
                         reference_reconstruction, args.output_folder, args.max_points, device
                     )
             
+                del batch_points_3d, batch_colors
+
             # Clear GPU memory
-            del batch_images, batch_predictions, batch_points_3d, batch_colors
+            del batch_images, batch_predictions
             torch.cuda.empty_cache()
 
         if args.verbose:

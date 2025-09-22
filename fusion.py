@@ -83,13 +83,20 @@ class DepthMapFusion:
                 camera_pose = data['camera_pose']
                 image_name = str(data['image_name'])
                 
+                # Check for prior depth map
+                prior_depth_map = None
+                if 'prior_depth_map' in data:
+                    prior_depth_map = data['prior_depth_map']
+                
                 # Squeeze extra dimensions if present
                 if depth_map.ndim == 4:
                     depth_map = depth_map.squeeze(0).squeeze(-1)
                 if confidence_map.ndim == 4:
                     confidence_map = confidence_map.squeeze(0).squeeze(-1)
+                if prior_depth_map is not None and prior_depth_map.ndim == 4:
+                    prior_depth_map = prior_depth_map.squeeze(0).squeeze(-1)
                 
-                # Initialize processing mask
+                # Initialize processing mask (don't mark prior pixels as processed yet)
                 processing_mask = np.zeros(depth_map.shape, dtype=bool)
                 
                 # Load corresponding image for color assignment
@@ -105,6 +112,7 @@ class DepthMapFusion:
                 depth_data = {
                     'depth_map': depth_map,
                     'confidence_map': confidence_map,
+                    'prior_depth_map': prior_depth_map,
                     'camera_intrinsics': camera_intrinsics,
                     'camera_pose': camera_pose,
                     'image_id': image_id,
@@ -288,20 +296,25 @@ class DepthMapFusion:
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), np.array([])
         
         depth_map = data['depth_map']
+        prior_depth_map = data.get('prior_depth_map', None)
         processing_mask = data['processing_mask']
         camera_intrinsics = data['camera_intrinsics']
         camera_pose = data['camera_pose']
         image = data['image']
         
-        # Create mask for unprocessed pixels with valid depth
+        # Only use predicted depth map for unprocessed pixels
+        # Prior depths are handled separately in _generate_points_from_prior_depth
         valid_depth_mask = (depth_map > 0) & (~processing_mask)
+        active_depth_map = depth_map
+        if self.verbose:
+            print(f"Using predicted depth map for {np.sum(valid_depth_mask)} pixels")
         
         if not np.any(valid_depth_mask):
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), np.array([])
         
         # Get valid pixel coordinates
         y_coords, x_coords = np.where(valid_depth_mask)
-        depths = depth_map[valid_depth_mask]
+        depths = active_depth_map[valid_depth_mask]
         
         # Convert to 3D points
         fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
@@ -326,6 +339,66 @@ class DepthMapFusion:
         
         return points_3d, colors, valid_depth_mask
     
+    def _generate_points_from_prior_depth(self, image_id: int) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Generate 3D points from prior depth map if available.
+        
+        Args:
+            image_id: ID of the image
+            
+        Returns:
+            Tuple of (points_3d, colors)
+        """
+        data = self._get_depth_data_by_id(image_id)
+        if data is None:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+        
+        prior_depth_map = data.get('prior_depth_map', None)
+        if prior_depth_map is None or not np.any(prior_depth_map > 0):
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+        
+        camera_intrinsics = data['camera_intrinsics']
+        camera_pose = data['camera_pose']
+        image = data['image']
+        
+        # Get valid prior depth pixels
+        prior_valid_mask = prior_depth_map > 0
+        
+        if not np.any(prior_valid_mask):
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+        
+        # Get valid pixel coordinates
+        y_coords, x_coords = np.where(prior_valid_mask)
+        depths = prior_depth_map[prior_valid_mask]
+        
+        # Convert to 3D points
+        fx, fy = camera_intrinsics[0, 0], camera_intrinsics[1, 1]
+        cx, cy = camera_intrinsics[0, 2], camera_intrinsics[1, 2]
+        
+        # Camera coordinates
+        x_cam = (x_coords - cx) * depths / fx
+        y_cam = (y_coords - cy) * depths / fy
+        z_cam = depths
+        
+        # Stack to get camera coordinates
+        points_cam = np.column_stack([x_cam, y_cam, z_cam])
+        
+        # Transform to world coordinates
+        points_cam_homo = np.column_stack([points_cam, np.ones(len(points_cam))])
+        points_3d = (camera_pose @ points_cam_homo.T).T[:, :3]
+        
+        # Get colors from image
+        colors = np.ones((len(points_3d), 3), dtype=np.float32) * 0.5  # Default gray
+        if image is not None:
+            colors = image[prior_valid_mask] / 255.0
+        
+        # Mark these pixels as processed
+        data['processing_mask'][prior_valid_mask] = True
+        if self.verbose:
+            print(f"Marked {np.sum(prior_valid_mask)} prior depth pixels as processed")
+        
+        return points_3d, colors
+    
     def _update_processing_masks(self, image_id: int, valid_mask: np.ndarray):
         """Update processing mask for the given image ID."""
         data = self._get_depth_data_by_id(image_id)
@@ -349,7 +422,7 @@ class DepthMapFusion:
             self.depth_data_by_id.items(), 
             desc="Fusing point clouds", 
             unit="image",
-            disable=not self.verbose
+            disable=False  # Always show progress bar
         )
         
         for i, (image_id, ref_data) in enumerate(progress_bar):
@@ -359,6 +432,14 @@ class DepthMapFusion:
             if self.verbose:
                 print(f"\nProcessing {i+1}/{len(self.depth_data_by_id)}: {ref_data['image_name']} (ID: {image_id})")
             
+            # First, generate points from prior depths if available
+            prior_points_3d, prior_colors = self._generate_points_from_prior_depth(image_id)
+            if len(prior_points_3d) > 0:
+                all_points.append(prior_points_3d)
+                all_colors.append(prior_colors)
+                if self.verbose:
+                    print(f"Added {len(prior_points_3d)} points from prior depths for {ref_data['image_name']}")
+            
             # Find partner images
             partner_image_ids = self._find_partner_images(image_id)
             
@@ -367,12 +448,12 @@ class DepthMapFusion:
                     print(f"No partner images found for {ref_data['image_name']}")
                 continue
             
-            # Generate 3D points from reference image
+            # Generate 3D points from remaining unprocessed pixels
             points_3d, colors, valid_mask = self._generate_points_from_depth(image_id)
             
             if len(points_3d) == 0:
                 if self.verbose:
-                    print(f"No valid points generated from {ref_data['image_name']}")
+                    print(f"No valid points generated from remaining pixels in {ref_data['image_name']}")
                 continue
             
             # Check consistency with partner images
