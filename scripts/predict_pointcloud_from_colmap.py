@@ -39,7 +39,7 @@ from mapanything.models import MapAnything
 from mapanything.utils.geometry import depthmap_to_world_frame
 from mapanything.utils.image import rgb
 from mapanything.utils.misc import seed_everything
-from colmap_utils import ColmapReconstruction, find_image_match
+from colmap_utils import ColmapReconstruction, build_image_id_mapping
 from uniception.models.encoders.image_normalizations import IMAGE_NORMALIZATION_DICT
 
 # Configure CUDA settings
@@ -128,12 +128,6 @@ def parse_args():
         action="store_true",
         default=False,
         help="Enable verbose output and save colorized prior and predicted depth maps",
-    )
-    parser.add_argument(
-        "--validate_prior_only",
-        action="store_true",
-        default=False,
-        help="Only validate prior depthmap generation without running MapAnything predictions",
     )
     return parser.parse_args()
 
@@ -370,7 +364,7 @@ def colorize_heatmap(data_map, colormap='plasma', save_path=None, data_range=Non
     return colorized_rgb, actual_range
 
 
-def compute_prior_depthmap(reference_reconstruction, image_id, scaled_intrinsics, pose_matrix, target_size, min_track_length=2, verbose=False, output_folder=None):
+def compute_prior_depthmap(reference_reconstruction, image_id, scaled_intrinsics, pose_matrix, target_size, min_track_length):
     """
     Compute prior depth map from reference COLMAP reconstruction for a specific image.
     This depth map will be provided to the MapAnything model as prior information via the 'depth_z' key.
@@ -381,10 +375,7 @@ def compute_prior_depthmap(reference_reconstruction, image_id, scaled_intrinsics
         scaled_intrinsics: (3, 3) scaled camera intrinsics matrix
         pose_matrix: (3, 4) camera pose matrix (cam_from_world)
         target_size: target image size for depth map
-        min_track_length: minimum track length for 3D points to include
-        verbose: if True, save colorized depth maps to output folder
-        output_folder: folder to save colorized depth maps when verbose=True
-        
+        min_track_length: minimum track length for 3D points to include        
     Returns:
         tuple: (prior_depth, depth_range) where:
             - prior_depth: (target_size, target_size) numpy array with depth values, or None if no points
@@ -422,10 +413,6 @@ def compute_prior_depthmap(reference_reconstruction, image_id, scaled_intrinsics
             min_depth = np.min(depth_map[valid_mask])
             max_depth = np.max(depth_map[valid_mask])
             depth_range = (min_depth, max_depth)
-        
-        # Note: Prior depth maps will be saved after inference with consistent scaling
-        if verbose and output_folder is not None:
-            print(f"Prior depth computed for image {image_id}, will be saved after inference")
         
         return depth_map, depth_range
         
@@ -611,37 +598,7 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
             
             # Store prior depth for this view
             all_prior_depths.append(prior_depth)
-            
-            # Compute and save point cloud from prior depth map for comparison
-            if prior_depth is not None and np.sum(prior_depth > 0) > 0:
-                print(f"Computing point cloud from prior depth map for {img_name}...")
-                
-                # Create a dummy image for color information
-                dummy_image = np.ones((target_size, target_size, 3), dtype=np.float32) * 0.5
-                
-                # Convert depth map to point cloud using ground truth parameters
-                # Convert cam_from_world to cam2world for the function
-                pose_4x4 = np.eye(4)
-                pose_4x4[:3, :] = pose_matrix
-                pose_4x4 = np.linalg.inv(pose_4x4)  # Convert cam_from_world to cam2world
-                
-                prior_points_from_depth, prior_colors_from_depth = compute_pointcloud_from_depthmap_groundtruth(
-                    prior_depth, dummy_image, K_scaled, pose_4x4,
-                    conf_threshold=0.0, max_points=None
-                )
-                
-                if len(prior_points_from_depth) > 0:
-                    print(f"Generated {len(prior_points_from_depth)} points from prior depth map")
-                    # Save the point cloud from prior depth map
-                    if output_folder is not None and verbose:
-                        save_single_pointcloud(prior_points_from_depth, prior_colors_from_depth, image_id, img_name, 
-                                             "depth_prior", output_folder)
-                        print(f"Saved prior depth point cloud for {img_name}")
-                else:
-                    print(f"Warning: No points generated from prior depth map for {img_name}")
-            else:
-                print(f"Warning: No valid prior depth map for {img_name}")
-        
+                    
         view = {
             "img": images[view_idx][None],  # Add batch dimension
             "data_norm_type": [model.encoder.data_norm_type],
@@ -812,285 +769,338 @@ def run_mapanything_inference(model, images, reconstruction, image_ids, target_s
     return predictions, all_prior_depths
 
 
-def compute_pointcloud_from_depthmap_groundtruth(depthmap, image, groundtruth_intrinsics, groundtruth_pose, conf_threshold=0.0, max_points=None):
+
+
+class DepthData:
     """
-    Compute point cloud from depth map using ground truth pose and intrinsics.
-    This function confirms the depth map to point cloud computation is accurate.
+    Depth data class for storing depth related data.
+    """
     
-    Args:
-        depthmap: (H, W) numpy array with depth values
-        image: (H, W, 3) numpy array with RGB values
-        groundtruth_intrinsics: (3, 3) ground truth camera intrinsics matrix
-        groundtruth_pose: (4, 4) ground truth camera pose matrix (cam2world)
-        conf_threshold: Confidence threshold for filtering points (not used for ground truth)
-        max_points: Maximum number of points to keep (None for no limit)
+    def __init__(self, 
+                 scene_folder: str,
+                 reconstruction: ColmapReconstruction, 
+                 target_size: int,
+                 output_folder: str
+                 ) -> None:
+
+        """
+        Initialize the depth data class.
         
-    Returns:
-        tuple: (points_3d, colors) - numpy arrays
-    """
-    print("Computing point cloud from depth map using ground truth pose and intrinsics...")
-    
-    if depthmap is None or np.max(depthmap) == 0:
-        print("Warning: No valid depth values in depth map")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
-    
-    # Convert to torch tensors
-    depthmap_torch = torch.tensor(depthmap, dtype=torch.float32)
-    intrinsics_torch = torch.tensor(groundtruth_intrinsics, dtype=torch.float32)
-    pose_torch = torch.tensor(groundtruth_pose, dtype=torch.float32)
-    
-    # Compute 3D points from depth using ground truth parameters
-    pts3d, valid_mask = depthmap_to_world_frame(
-        depthmap_torch, intrinsics_torch, pose_torch
-    )
-    
-    # Convert to numpy
-    pts3d_np = pts3d.cpu().numpy()
-    valid_mask_np = valid_mask.cpu().numpy()
-    
-    # Extract valid points and colors
-    if valid_mask_np.any():
+        Args:
+            reconstruction: COLMAP reconstruction object
+            scene_folder: Path to scene folder containing images
+            target_size: Target image size
+            output_folder: Path to output folder
+        """
+        self.reconstruction = reconstruction
+        self.scene_folder = scene_folder
+        self.reference_reconstruction = None
+        self.target_size = target_size
+        self.output_folder = os.path.join(output_folder, "depth_maps")
+        os.makedirs(output_folder, exist_ok=True)
+
+        # stores all the depth data for each image
+        self.scene_depth_data = {}
+
+        self.active_image_ids = reconstruction.get_all_image_ids()
+        self.source_to_target_image_id_mapping = {}
+
+    def get_depth_data(self, image_id: int) -> dict:
+        if image_id not in self.scene_depth_data:
+            self.initialize_depth_data(image_id)
+        return self.scene_depth_data[image_id]
+
+    def initialize_from_folder(self):
+        import glob
+        depth_data_files = glob.glob(os.path.join(self.output_folder, "*.npz"))
+        for df in depth_data_files:
+            data = np.load(df)
+            image_id = int(data['image_id'])
+            self.scene_depth_data[image_id] = data
+
+    def initialize_with_reference(self, reference_reconstruction: ColmapReconstruction) -> None:
+
+        self.reference_reconstruction = reference_reconstruction
+        if self.reference_reconstruction is None:
+            raise ValueError("Reference reconstruction is required to initialize with reference")
+
+        self.source_to_target_image_id_mapping =  build_image_id_mapping(self.reconstruction, self.reference_reconstruction)
+
+        valid_target_image_ids = self.reference_reconstruction.get_image_ids_with_valid_points()
+
+        # active image ids are the image ids that have a valid mapping from the source reconstruction to the reference reconstruction
+        self.active_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if self.source_to_target_image_id_mapping[img_id] is not None and  self.source_to_target_image_id_mapping[img_id] in valid_target_image_ids]
+        print(f"Found {len(self.active_image_ids)}/{self.reconstruction.get_num_images()} active image ids")
+
+        # missing image ids are the image ids that do not have a valid mapping from the source reconstruction to the reference reconstruction
+        self.missing_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if img_id not in self.active_image_ids]
+        print(f"Missing Image IDs: {self.missing_image_ids}")
+        for img_id in self.missing_image_ids:
+            print(f"  {img_id}: {self.reconstruction.get_image_name(img_id)}")
+
+        for img_id in self.active_image_ids:
+            self.initialize_depth_data(img_id)
+            self.initialize_prior_depth_data(img_id)
+            self.initialize_scaled_image(img_id)
+
+    def initialize_depth_data(self, image_id: int) -> None:
+        if not self.reconstruction.has_image(image_id):
+            raise ValueError(f"Image {image_id} not found in reconstruction")
+
+        # Extract camera intrinsics and scale for target size
+        camera = self.reconstruction.get_image_camera(image_id)
+        original_width, original_height = camera.width, camera.height
+        
+        # Get intrinsics matrix and scale it for the target resolution
+        K = self.reconstruction.get_camera_calibration_matrix(image_id)
+        
+        # Scale intrinsics for resized image
+        scale_x = self.target_size / original_width
+        scale_y = self.target_size / original_height
+        K_scaled = K.copy()
+        K_scaled[0, :] *= scale_x  # Scale fx and cx
+        K_scaled[1, :] *= scale_y  # Scale fy and cy
+            
+        # Get camera pose (world to camera transformation)
+        pose_4x4 = np.eye(4)
+        cam_from_world = self.reconstruction.get_image_cam_from_world(image_id)
+        pose_4x4[:3, :] = cam_from_world.matrix()  # 3x4 transformation matrix
+
+        depth_data = {
+            'image_id': image_id,
+            'image_name': self.reconstruction.get_image_name(image_id),
+            'scaled_image': None,
+            'depth_map': None,
+            'confidence_map': None,
+            'prior_depth_map': None,
+            'depth_range': None,
+            'confidence_range': None,
+            'camera_intrinsics': K_scaled,  # Use scaled intrinsics
+            'camera_pose': pose_4x4,        # Use 4x4 cam_from_world pose matrix
+            'original_intrinsics': K,       # Also save original intrinsics for reference,
+            'target_size': self.target_size
+        }
+        self.scene_depth_data[image_id] = depth_data
+
+    def initialize_prior_depth_data(self, image_id: int) -> None:
+        if self.reference_reconstruction is None:
+            return
+        depth_data = self.get_depth_data(image_id)
+        ref_image_id = self.source_to_target_image_id_mapping[image_id]
+        assert ref_image_id is not None, f"No target image id found for image {image_id}"
+        cam_from_world = depth_data['camera_pose'][:3, :]
+        prior_depth_map, depth_range = compute_prior_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], cam_from_world, self.target_size, min_track_length=1)
+        if prior_depth_map is None:
+            print(f"Warning: No prior depth map found for image {image_id}")
+        depth_data['prior_depth_map'] = prior_depth_map
+        depth_data['depth_range'] = depth_range
+
+    def initialize_scaled_image(self, image_id: int) -> None:
+        depth_data = self.get_depth_data(image_id)
+        if depth_data['scaled_image'] is not None:
+            target_size = depth_data['target_size']
+            assert depth_data['scaled_image'].shape == (target_size, target_size, 3), f"Scaled image shape {depth_data['scaled_image'].shape} does not match target size {target_size}"
+            return
+        image_path = os.path.join(self.scene_folder, depth_data['image_name'])
+        img = Image.open(image_path)
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = img.convert("RGB")
+        depth_data['scaled_image'] = img.resize((depth_data['target_size'], depth_data['target_size']), Image.Resampling.BICUBIC)
+
+    def update_depth_data(self, image_id: int, depth_map: np.ndarray, confidence_map: np.ndarray) -> None:
+        depth_data = self.get_depth_data(image_id)
+        if depth_map.ndim == 4:
+            depth_map = depth_map.squeeze(0).squeeze(-1)
+        if confidence_map.ndim == 4:
+            confidence_map = confidence_map.squeeze(0).squeeze(-1)
+        depth_data['depth_map'] = depth_map
+        depth_data['confidence_map'] = confidence_map
+        depth_data['confidence_range'] = (np.min(confidence_map), np.max(confidence_map))
+
+        target_size = depth_data['target_size']
+        assert depth_map.shape == (target_size, target_size), f"Depth map shape {depth_map.shape} does not match target size {target_size}"
+        assert confidence_map.shape == (target_size, target_size), f"Confidence map shape {confidence_map.shape} does not match target size {target_size}"
+
+    def save_depth_data(self, image_id: int) -> None:
+        depth_data = self.get_depth_data(image_id)
+        filepath = os.path.join(self.output_folder, f"depth_{image_id:06d}.npz")
+        np.savez_compressed(filepath, **depth_data)
+
+    def save(self) -> None:
+        for img_id in self.scene_depth_data:
+            self.save_depth_data(img_id)
+
+    def load_prior_depth_data(self, image_id: int) -> None:
+        filepath = os.path.join(self.output_folder, f"depth_{image_id:06d}.npz")
+        self.scene_depth_data[image_id] = np.load(filepath)
+
+    def get_point_cloud(self, image_id: int, max_points: int = 1000000, conf_threshold: float = 0.0) -> tuple:
+        depth_data = self.get_depth_data(image_id)
+
+        depth_map = depth_data['depth_map']  # (H, W)
+        confidence_map = depth_data['confidence_map']  # (H, W)
+        camera_intrinsics = depth_data['camera_intrinsics']  # (3, 3) - scaled intrinsics
+        cam_from_world = depth_data['camera_pose']  # (4, 4) - camera_from_world pose
+        image_id = depth_data['image_id']
+        image_name = depth_data['image_name']
+        scaled_image = depth_data['scaled_image']
+
+        # depth_range = depth_data['depth_range']
+        # confidence_range = depth_data['confidence_range']
+        # print(f"Loaded depth map for {image_name} (ID: {image_id})")
+        # print(f"Depth map shape: {depth_map.shape}")
+        # print(f"Depth range: {depth_range[0]:.3f} - {depth_range[1]:.3f}")
+        # print(f"Confidence range: {confidence_range[0]:.3f} - {confidence_range[1]:.3f}")
+        
+        # Filter by confidence threshold
+        if conf_threshold > 0.0 and confidence_map is not None:
+            valid_mask = confidence_map >= conf_threshold
+            depth_map_filtered = depth_map.copy()
+            depth_map_filtered[~valid_mask] = 0
+            print(f"Filtered by confidence >= {conf_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map.shape)} pixels")
+        else:
+            depth_map_filtered = depth_map
+
+        # Check if we have valid depth values
+        if np.max(depth_map_filtered) == 0:
+            print("Warning: No valid depth values after filtering")
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+        
+        cam_to_world = np.linalg.inv(cam_from_world)
+
+        # Convert to torch tensors
+        depthmap_torch   = torch.tensor(depth_map_filtered, dtype=torch.float32)
+        intrinsics_torch = torch.tensor(camera_intrinsics, dtype=torch.float32)
+        pose_torch       = torch.tensor(cam_to_world, dtype=torch.float32)
+        
+        # Compute 3D points from depth using the saved camera parameters
+        result = depthmap_to_world_frame(depthmap_torch, intrinsics_torch, pose_torch)
+        
+        # Handle different return formats
+        if len(result) == 2:
+            pts3d, valid_mask = result
+        else:
+            print(f"Warning: depthmap_to_world_frame returned {len(result)} values, expected 2")
+            pts3d, valid_mask = result[0], result[1]
+        
+        # Convert to numpy
+        pts3d_np = pts3d.cpu().numpy()
+        valid_mask_np = valid_mask.cpu().numpy()
+
+        if not valid_mask_np.any():
+            print("Warning: No valid points found in depth map")
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+
+        # Extract valid points
         valid_pts = pts3d_np[valid_mask_np]
-        valid_colors = image[valid_mask_np]  # (N, 3)
-        
-        # Ensure colors are in [0, 1] range
-        if valid_colors.max() > 1.0:
-            valid_colors = valid_colors / 255.0
-        
-        # Only subsample if max_points is specified and we have more points than the limit
+
+        colors = np.ones((len(valid_pts), 3), dtype=np.float32) * 0.5  # Gray color
+        if scaled_image is not None:
+            simg = scaled_image.reshape(-1, 3) / 255.0
+            colors = simg[valid_mask_np]
+
+        # Subsample if max_points is specified
         if max_points is not None and len(valid_pts) > max_points:
-            print(f"Subsampling from {len(valid_pts)} to {max_points} points...")
             indices = np.random.choice(len(valid_pts), max_points, replace=False)
             valid_pts = valid_pts[indices]
-            valid_colors = valid_colors[indices]
-        
-        print(f"Generated point cloud with {len(valid_pts)} points using ground truth parameters")
-        return valid_pts, valid_colors
-    else:
-        print("Warning: No valid points found in depth map")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
+            colors = colors[indices]
 
+        return valid_pts, colors
 
-def get_groundtruth_camera_parameters(reconstruction, image_id, target_size, device="cuda"):
-    """
-    Get ground truth camera parameters for an image.
-    
-    Args:
-        reconstruction: ColmapReconstruction object
-        image_id: COLMAP image ID
-        target_size: Target image size for scaling
-        device: Device to place tensors on
+    def initialize_batches_geometric(self, batch_size: int) -> None:
+        """
+        Split image IDs into batches using COLMAP reconstruction quality metrics.
+        Each batch consists of a reference image and its best partner images.
+        Once images are used in a batch, they cannot be reference images for future batches.
         
-    Returns:
-        tuple: (scaled_intrinsics, pose_matrix) as torch tensors
-    """
-    # Get camera info
-    camera = reconstruction.get_image_camera(image_id)
-    original_width, original_height = camera.width, camera.height
-    
-    # Get ground truth intrinsics and scale for target resolution
-    K = reconstruction.get_camera_calibration_matrix(image_id)
-    
-    # Scale intrinsics for resized image
-    scale_x = target_size / original_width
-    scale_y = target_size / original_height
-    K_scaled = K.copy()
-    K_scaled[0, :] *= scale_x  # Scale fx and cx
-    K_scaled[1, :] *= scale_y  # Scale fy and cy
-    
-    # Get ground truth camera pose (world to camera transformation)
-    cam_from_world = reconstruction.get_image_cam_from_world(image_id)
-    pose_matrix = cam_from_world.matrix()  # 3x4 transformation matrix
-    
-    # Convert to 4x4 homogeneous matrix
-    pose_4x4 = np.eye(4)
-    pose_4x4[:3, :] = pose_matrix
-    
-    # Convert from cam_from_world to cam2world (world_from_cam) for MapAnything
-    # MapAnything expects OpenCV cam2world convention: camera coordinates -> world coordinates
-    pose_4x4 = np.linalg.inv(pose_4x4)
-    
-    # Convert to torch tensors and move to device
-    intrinsics_torch = torch.tensor(K_scaled, dtype=torch.float32, device=device)
-    camera_pose_torch = torch.tensor(pose_4x4, dtype=torch.float32, device=device)
-    
-    return intrinsics_torch, camera_pose_torch
+        Args:
+            reconstruction: ColmapReconstruction object
+            image_ids: List of image IDs
+            batch_size: Maximum number of images per batch
+            
+        Returns:
+            List of batches, where each batch is a list of image IDs
+        """
 
+        # Ensure image point mappings are built
+        self.reconstruction._ensure_image_point_maps()
 
-def extract_points_from_single_prediction(pred, image_id, reconstruction, conf_threshold=0.0, use_groundtruth=True, device="cuda"):
-    """
-    Extract 3D points from a single prediction.
-    
-    Args:
-        pred: Single prediction dictionary
-        image_id: COLMAP image ID
-        reconstruction: ColmapReconstruction object
-        conf_threshold: Confidence threshold for filtering points
-        use_groundtruth: If True, use ground truth parameters
-        device: Device to place tensors on
+        batches = []
+        used_as_reference = set()  # Images that have been used as reference images
         
-    Returns:
-        tuple: (points_3d, colors) - numpy arrays, or (None, None) if no valid points
-    """
-    # Extract prediction data
-    depthmap_torch = pred["depth_z"][0].squeeze(-1)  # (H, W)
-    conf_torch = pred["conf"][0]  # (H, W)
-    
-    # Ensure depth map is on the correct device
-    if depthmap_torch.device != torch.device(device):
-        depthmap_torch = depthmap_torch.to(device)
-    
-    if use_groundtruth:
-        # Get ground truth camera parameters
-        intrinsics_torch, camera_pose_torch = get_groundtruth_camera_parameters(
-            reconstruction, image_id, depthmap_torch.shape[0], device
-        )
-        print(f"Using ground truth parameters for image {image_id}")
-    else:
-        # Use predicted parameters (original behavior)
-        intrinsics_torch = pred["intrinsics"][0].to(device)  # (3, 3)
-        camera_pose_torch = pred["camera_poses"][0].to(device)  # (4, 4)
-        print(f"Using predicted parameters for image {image_id}")
-    
-    # Compute 3D points from depth
-    pts3d, valid_mask = depthmap_to_world_frame(
-        depthmap_torch, intrinsics_torch, camera_pose_torch
-    )
-    
-    # Get mask from predictions
-    mask = pred["mask"][0].squeeze(-1).cpu().numpy().astype(bool)
-    mask = mask & valid_mask.cpu().numpy()  # Combine with valid depth mask
-    
-    # Apply confidence threshold
-    if conf_threshold > 0:
-        conf_mask = conf_torch.cpu().numpy() >= conf_threshold
-        mask = mask & conf_mask
-    
-    # Extract valid points and colors
-    if mask.any():
-        valid_pts = pts3d.cpu().numpy()[mask]
+        # Sort image IDs for consistent processing order
+        remaining_candidates = sorted(self.active_image_ids)
         
-        # Get colors from denormalized image
-        img_no_norm = pred["img_no_norm"][0].cpu().numpy()  # (H, W, 3)
-        valid_colors = img_no_norm[mask]  # (N, 3)
-        
-        return valid_pts, valid_colors
-    else:
-        return None, None
+        while len(used_as_reference) < len(self.active_image_ids):
 
+            reference_image_id = None
+            for img_id in remaining_candidates:
+                if img_id not in used_as_reference:
+                    reference_image_id = img_id
+                    break
+            
+            if reference_image_id is None:
+                break
 
-def extract_point_cloud_from_predictions(predictions, reconstruction, image_ids, conf_threshold=0.0, max_points=1000000, use_groundtruth=True, device="cuda"):
-    """
-    Extract point cloud from model predictions using ground truth pose and intrinsics.
-    
-    Args:
-        predictions: List of prediction dictionaries
-        reconstruction: ColmapReconstruction object for ground truth data
-        image_ids: List of COLMAP image IDs corresponding to the predictions
-        conf_threshold: Confidence threshold for filtering points
-        max_points: Maximum number of points to keep
-        use_groundtruth: If True, use ground truth pose and intrinsics instead of predicted ones
-        device: Device to place tensors on
-        
-    Returns:
-        tuple: (points_3d, colors) - numpy arrays
-    """
-    print("Extracting point cloud from predictions using ground truth pose and intrinsics...")
-    
-    all_points = []
-    all_colors = []
-    
-    for view_idx, pred in enumerate(predictions):
-        image_id = image_ids[view_idx]
-        
-        # Extract points from single prediction
-        points, colors = extract_points_from_single_prediction(
-            pred, image_id, reconstruction, conf_threshold, use_groundtruth, device
-        )
-        
-        if points is not None:
-            all_points.append(points)
-            all_colors.append(colors)
-    
-    if len(all_points) == 0:
-        print("Warning: No valid points found in predictions")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3)
-    
-    # Concatenate all points and colors
-    points_3d = np.concatenate(all_points, axis=0)
-    colors = np.concatenate(all_colors, axis=0)
-    
-    # Ensure colors are in [0, 1] range
-    if colors.max() > 1.0:
-        colors = colors / 255.0
-    
-    # Randomly subsample if too many points
-    if len(points_3d) > max_points:
-        print(f"Subsampling from {len(points_3d)} to {max_points} points...")
-        indices = np.random.choice(len(points_3d), max_points, replace=False)
-        points_3d = points_3d[indices]
-        colors = colors[indices]
-    
-    print(f"Generated point cloud with {len(points_3d)} points")
-    return points_3d, colors
-
-
-def build_image_name_mapping(reconstruction, reference_reconstruction, image_ids):
-    """
-    Build mapping between source and target image IDs for reference reconstruction.
-    
-    Args:
-        reconstruction: Source ColmapReconstruction object
-        reference_reconstruction: Target ColmapReconstruction object
-        image_ids: List of image IDs to map
-        
-    Returns:
-        dict: Mapping from source image_id to target image_id (or None if no match)
-    """
-    image_name_mapping = {}
-    if reference_reconstruction is not None:
-        for img_id in image_ids:
-            match_result = find_image_match(
-                source_reconstruction=reconstruction,
-                target_reconstruction=reference_reconstruction,
-                source_image_id=img_id,
-                pose_tolerance_rotation=0.1,
-                pose_tolerance_translation=0.1,
-                verbose=False
+            best_partners = self.reconstruction.find_best_partner_for_image(
+                reference_image_id, 
+                min_points=50,  # Lower threshold for more flexibility
+                parallax_sample_size=50
             )
-            if match_result['match_found']:
-                image_name_mapping[img_id] = match_result['target_image_id']
-            else:
-                image_name_mapping[img_id] = None
-    return image_name_mapping
+            
+            valid_partners = [pid for pid in best_partners if pid != -1 and pid in self.active_image_ids]
+            
+            # Start batch with reference image
+            batch = [reference_image_id]
+            
+            # Add best partners up to batch_size
+            for partner in valid_partners:
+                if len(batch) >= batch_size:
+                    break
+                if partner not in batch:  # Avoid duplicates
+                    batch.append(partner)
 
 
-def save_single_pointcloud(points, colors, image_id, img_name, pc_type, output_folder):
-    """
-    Save a single point cloud to file.
-    
-    Args:
-        points: 3D points array
-        colors: Colors array
-        image_id: COLMAP image ID
-        img_name: Image name
-        pc_type: Type of point cloud ('predicted' or 'prior')
-        output_folder: Output folder path
+            # If batch is too small, fill with any remaining images that haven't been references
+            if len(batch) < batch_size:
+                for img_id in remaining_candidates:
+                    if len(batch) >= batch_size:
+                        break
+                    if img_id not in batch and img_id not in used_as_reference:
+                        batch.append(img_id)
+            
+            # Mark ALL images in this batch as used (cannot be reference images anymore)
+            for img_id in batch:
+                used_as_reference.add(img_id)
+
+            batches.append(batch)
+            
+        all_batched_images = set()
+        for batch in batches:
+            all_batched_images.update(batch)
         
-    Returns:
-        str: Path to saved point cloud file, or None if no points
-    """
-    if len(points) == 0:
-        return None
-    
-    individual_pc_folder = os.path.join(output_folder, "individual_pointclouds")
-    os.makedirs(individual_pc_folder, exist_ok=True)
-    
-    pc = trimesh.PointCloud(vertices=points, colors=(colors * 255).astype(np.uint8))
-    pc_path = os.path.join(individual_pc_folder, f"{pc_type}_{image_id}_{img_name}.ply")
-    pc.export(pc_path)
-    print(f"Saved {pc_type} point cloud: {pc_path} ({len(points)} points)")
-    return pc_path
+        remaining_unprocessed = [img_id for img_id in self.active_image_ids if img_id not in all_batched_images]
+        
+        if remaining_unprocessed:
+            batches.append(remaining_unprocessed)
+        
+        return batches
+
+    def initialize_batches_sequential(self, batch_size: int) -> None:
+        """
+        Simple sequential split into batches.
+        Args:
+            batch_size: Maximum number of images per batch
+        Returns:
+            List of batches, where each batch is a list of image IDs
+        """
+        batches = []
+        for i in range(0, len(self.active_image_ids), batch_size):
+            batch = self.active_image_ids[i:i + batch_size]
+            batches.append(batch)
+        return batches
 
 
 def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder, device, target_size, prior_depths=None):
@@ -1208,890 +1218,12 @@ def save_depth_maps_as_npz(predictions, reconstruction, image_ids, output_folder
     print(f"Saved {len([p for p in predictions if p is not None])} depth maps to {depth_maps_dir}")
 
 
-def load_npz_and_generate_pointcloud(npz_filepath, conf_threshold=0.0, max_points=None):
-    """
-    Load a depth map from NPZ file and generate a point cloud.
-    
-    Args:
-        npz_filepath: Path to the NPZ file containing depth map and camera parameters
-        conf_threshold: Confidence threshold for filtering points (default: 0.0)
-        max_points: Maximum number of points to keep (None for no limit)
-        
-    Returns:
-        tuple: (points_3d, colors, metadata) - numpy arrays and metadata dict
-    """
-    print(f"Loading depth map from: {npz_filepath}")
-    
-    # Load NPZ file
-    data = np.load(npz_filepath)
-    
-    # Extract data
-    depth_map = data['depth_map']  # (H, W) or (1, H, W, 1)
-    confidence_map = data['confidence_map']  # (H, W) or (1, H, W, 1)
-    camera_intrinsics = data['camera_intrinsics']  # (3, 3) - scaled intrinsics
-    camera_pose = data['camera_pose']  # (4, 4) - cam2world pose
-    image_id = data['image_id']
-    image_name = data['image_name']
-    
-    # Squeeze extra dimensions if present
-    if depth_map.ndim == 4:
-        depth_map = depth_map.squeeze(0).squeeze(-1)  # Remove batch and channel dims
-    if confidence_map.ndim == 4:
-        confidence_map = confidence_map.squeeze(0).squeeze(-1)  # Remove batch and channel dims
-    
-    print(f"Loaded depth map for {image_name} (ID: {image_id})")
-    print(f"Depth map shape: {depth_map.shape}")
-    print(f"Depth range: {np.min(depth_map[depth_map > 0]):.3f} - {np.max(depth_map[depth_map > 0]):.3f}")
-    print(f"Confidence range: {np.min(confidence_map):.3f} - {np.max(confidence_map):.3f}")
-    
-    # Filter by confidence threshold
-    if conf_threshold > 0.0:
-        valid_mask = confidence_map >= conf_threshold
-        depth_map_filtered = depth_map.copy()
-        depth_map_filtered[~valid_mask] = 0
-        print(f"Filtered by confidence >= {conf_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map.shape)} pixels")
-    else:
-        depth_map_filtered = depth_map
-    
-    # Check if we have valid depth values
-    if np.max(depth_map_filtered) == 0:
-        print("Warning: No valid depth values after filtering")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
-    
-    # Convert to torch tensors
-    depthmap_torch = torch.tensor(depth_map_filtered, dtype=torch.float32)
-    intrinsics_torch = torch.tensor(camera_intrinsics, dtype=torch.float32)
-    pose_torch = torch.tensor(camera_pose, dtype=torch.float32)
-    
-    # Compute 3D points from depth using the saved camera parameters
-    result = depthmap_to_world_frame(
-        depthmap_torch, intrinsics_torch, pose_torch
-    )
-    
-    # Handle different return formats
-    if len(result) == 2:
-        pts3d, valid_mask = result
-    else:
-        print(f"Warning: depthmap_to_world_frame returned {len(result)} values, expected 2")
-        pts3d, valid_mask = result[0], result[1]
-    
-    # Convert to numpy
-    pts3d_np = pts3d.cpu().numpy()
-    valid_mask_np = valid_mask.cpu().numpy()
-    
-    # Extract valid points
-    if valid_mask_np.any():
-        valid_pts = pts3d_np[valid_mask_np]
-        
-        # Create dummy colors (you could load actual image colors if needed)
-        colors = np.ones((len(valid_pts), 3), dtype=np.float32) * 0.5  # Gray color
-        
-        # Subsample if max_points is specified
-        if max_points is not None and len(valid_pts) > max_points:
-            print(f"Subsampling from {len(valid_pts)} to {max_points} points...")
-            indices = np.random.choice(len(valid_pts), max_points, replace=False)
-            valid_pts = valid_pts[indices]
-            colors = colors[indices]
-        
-        print(f"Generated point cloud with {len(valid_pts)} points")
-        
-        # Prepare metadata
-        metadata = {
-            'image_id': int(image_id),
-            'image_name': str(image_name),
-            'depth_range': (float(np.min(depth_map[depth_map > 0])), float(np.max(depth_map[depth_map > 0]))),
-            'confidence_range': (float(np.min(confidence_map)), float(np.max(confidence_map))),
-            'camera_intrinsics': camera_intrinsics,
-            'camera_pose': camera_pose,
-            'conf_threshold': conf_threshold,
-            'max_points': max_points
-        }
-        
-        return valid_pts, colors, metadata
-    else:
-        print("Warning: No valid points found in depth map")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
 
 
-def load_multiple_npz_and_generate_pointclouds(npz_folder, conf_threshold=0.0, max_points_per_file=None, max_total_points=None):
-    """
-    Load multiple NPZ files from a folder and generate point clouds.
-    
-    Args:
-        npz_folder: Path to folder containing NPZ files
-        conf_threshold: Confidence threshold for filtering points (default: 0.0)
-        max_points_per_file: Maximum points per file (None for no limit)
-        max_total_points: Maximum total points across all files (None for no limit)
-        
-    Returns:
-        tuple: (all_points, all_colors, metadata_list) - combined point clouds and metadata
-    """
-    import glob
-    
-    print(f"Loading NPZ files from: {npz_folder}")
-    
-    # Find all NPZ files
-    npz_files = glob.glob(os.path.join(npz_folder, "*.npz"))
-    if not npz_files:
-        print(f"No NPZ files found in {npz_folder}")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), []
-    
-    print(f"Found {len(npz_files)} NPZ files")
-    
-    all_points = []
-    all_colors = []
-    metadata_list = []
-    
-    for i, npz_file in enumerate(npz_files):
-        print(f"\nProcessing file {i+1}/{len(npz_files)}: {os.path.basename(npz_file)}")
-        
-        try:
-            points, colors, metadata = load_npz_and_generate_pointcloud(
-                npz_file, conf_threshold=conf_threshold, max_points=max_points_per_file
-            )
-            
-            if len(points) > 0:
-                all_points.append(points)
-                all_colors.append(colors)
-                metadata_list.append(metadata)
-                print(f"Added {len(points)} points from {metadata['image_name']}")
-            else:
-                print(f"Skipped {os.path.basename(npz_file)} - no valid points")
-                
-        except Exception as e:
-            print(f"Error processing {npz_file}: {e}")
-            continue
-    
-    if not all_points:
-        print("No valid point clouds generated from any NPZ files")
-        return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), []
-    
-    # Combine all point clouds
-    combined_points = np.vstack(all_points)
-    combined_colors = np.vstack(all_colors)
-    
-    print(f"\nCombined point cloud: {len(combined_points)} points from {len(all_points)} files")
-    
-    # Apply total point limit if specified
-    if max_total_points is not None and len(combined_points) > max_total_points:
-        print(f"Subsampling from {len(combined_points)} to {max_total_points} total points...")
-        indices = np.random.choice(len(combined_points), max_total_points, replace=False)
-        combined_points = combined_points[indices]
-        combined_colors = combined_colors[indices]
-    
-    print(f"Final point cloud: {len(combined_points)} points")
-    
-    return combined_points, combined_colors, metadata_list
 
 
-def process_single_image_pointclouds(pred, image_id, reconstruction, reference_reconstruction, 
-                                    image_name_mapping, max_points_per_image, device="cuda"):
-    """
-    Process point clouds for a single image (both predicted and prior if available).
-    
-    Args:
-        pred: Single prediction dictionary
-        image_id: COLMAP image ID
-        reconstruction: ColmapReconstruction object
-        reference_reconstruction: Reference reconstruction object
-        image_name_mapping: Mapping from source to target image IDs
-        max_points_per_image: Maximum points per image
-        device: Device to place tensors on
-        
-    Returns:
-        tuple: (predicted_points, predicted_colors, prior_points, prior_colors)
-    """
-    img_name = reconstruction.get_image_name(image_id)
-    
-    # Get ground truth parameters for this image
-    target_size = pred["depth_z"][0].squeeze(-1).shape[0]
-    intrinsics_torch, pose_torch = get_groundtruth_camera_parameters(
-        reconstruction, image_id, target_size, device
-    )
-    
-    # Convert to numpy for ground truth function
-    K_scaled = intrinsics_torch.cpu().numpy()
-    pose_4x4 = pose_torch.cpu().numpy()
-    
-    # Get predicted depth map and image
-    pred_depth = pred["depth_z"][0].squeeze(-1).cpu().numpy()
-    pred_image = pred["img_no_norm"][0].cpu().numpy()
-    
-    # Compute predicted point cloud using ground truth parameters
-    pred_points, pred_colors = compute_pointcloud_from_depthmap_groundtruth(
-        pred_depth, pred_image, K_scaled, pose_4x4, 
-        conf_threshold=0.0, max_points=max_points_per_image
-    )
-    
-    # Compute prior point cloud if reference reconstruction is available
-    prior_points, prior_colors = None, None
-    if reference_reconstruction is not None:
-        # Check if image has a match in reference reconstruction
-        if image_id in image_name_mapping and image_name_mapping[image_id] is not None:
-            ref_image_id = image_name_mapping[image_id]
-            
-            # Get the pose from the reference reconstruction
-            ref_cam_from_world = reference_reconstruction.get_image_cam_from_world(ref_image_id)
-            ref_pose_matrix = ref_cam_from_world.matrix()
-            ref_pose_4x4 = np.eye(4)
-            ref_pose_4x4[:3, :] = ref_pose_matrix
-            ref_pose_4x4 = np.linalg.inv(ref_pose_4x4)
-            
-            # Compute prior depth map
-            prior_depth, _ = compute_prior_depthmap(
-                reference_reconstruction=reference_reconstruction,
-                image_id=ref_image_id,
-                scaled_intrinsics=K_scaled,
-                pose_matrix=ref_pose_matrix,
-                target_size=target_size,
-                verbose=False,
-                output_folder=None
-            )
-            
-            if prior_depth is not None:
-                # Compute prior point cloud using ground truth parameters
-                prior_points, prior_colors = compute_pointcloud_from_depthmap_groundtruth(
-                    prior_depth, pred_image, K_scaled, pose_4x4,
-                    conf_threshold=0.0, max_points=max_points_per_image
-                )
-            else:
-                print(f"Warning: No prior depth computed for image {img_name} (ID:{image_id})")
-        else:
-            print(f"Warning: Image {img_name} (ID:{image_id}) not found in reference reconstruction")
-    
-    return pred_points, pred_colors, prior_points, prior_colors
 
 
-def validate_prior_depthmaps(reconstruction, reference_reconstruction, image_ids, 
-                            target_size, output_folder):
-    """
-    Validate prior depthmap generation before running full predictions.
-    This function tests the prior depthmap generation process and compares with reference points.
-    
-    Args:
-        reconstruction: ColmapReconstruction object (calibration reconstruction)
-        reference_reconstruction: ColmapReconstruction object (reference with 3D points)
-        image_ids: List of image IDs to test
-        target_size: Target image size for depth maps
-        output_folder: Output folder for saving results
-        
-    Returns:
-        bool: True if validation passes, False if significant issues found
-    """
-    print("\n" + "="*60)
-    print("🔍 VALIDATING PRIOR DEPTHMAP GENERATION")
-    print("="*60)
-    
-    if reference_reconstruction is None:
-        print("❌ No reference reconstruction provided - cannot validate prior depthmaps")
-        return False
-    
-    # Build image name mapping
-    print("Building image name mapping between reconstructions...")
-    image_name_mapping = build_image_name_mapping(
-        reconstruction, reference_reconstruction, image_ids
-    )
-    
-    # Find images with matches
-    matched_images = [(img_id, ref_id) for img_id, ref_id in image_name_mapping.items() 
-                     if ref_id is not None]
-    
-    if len(matched_images) == 0:
-        print("❌ No matching images found between reconstructions")
-        return False
-    
-    print(f"Found {len(matched_images)} matching images")
-    
-    # Test all matching images
-    test_images = matched_images
-    print(f"Testing all {len(test_images)} matching images for prior depthmap validation")
-    
-    validation_results = []
-    overall_success = True
-    
-    for cal_image_id, ref_image_id in test_images:
-        img_name = reconstruction.get_image_name(cal_image_id)
-        print(f"\n--- Testing Image: {img_name} (Cal_ID:{cal_image_id} → Ref_ID:{ref_image_id}) ---")
-        
-        try:
-            # Run comparison
-            comparison_results = compare_prior_depthmap_with_reference_points(
-                reconstruction, reference_reconstruction, cal_image_id, ref_image_id,
-                target_size, output_folder, verbose=True
-            )
-            
-            if comparison_results is None:
-                print(f"❌ Failed to generate comparison for {img_name}")
-                validation_results.append({
-                    'image_id': cal_image_id,
-                    'image_name': img_name,
-                    'success': False,
-                    'error': 'Comparison failed'
-                })
-                overall_success = False
-                continue
-            
-            # Check if results are acceptable
-            success = True
-            issues = []
-            critical_failure = False
-            
-            # Check for critical failures that indicate bugs
-            if 'distance_statistics' in comparison_results:
-                distance_stats = comparison_results['distance_statistics']
-                mean_distance = distance_stats.get('mean_distance', float('inf'))
-                
-                # Critical failure thresholds - these indicate bugs that must be fixed
-                if mean_distance > 0.1:  # 10cm threshold for critical failure
-                    critical_failure = True
-                    success = False
-                    issues.append(f"CRITICAL: Large mean distance: {mean_distance:.6f}m (>10cm)")
-                    print(f"\n🚨 CRITICAL VALIDATION FAILURE DETECTED!")
-                    print(f"   Image: {img_name}")
-                    print(f"   Mean distance: {mean_distance:.6f}m")
-                    print(f"   This indicates a bug in the depth map generation or point cloud conversion.")
-                    print(f"   Validation stopped - fix the bug before continuing.")
-                    break
-            
-            # Check other metrics for warnings
-            if 'overlap_percentage' in comparison_results:
-                overlap = comparison_results['overlap_percentage']
-                mean_dist = comparison_results['mean_min_distance']
-                
-                if overlap < 30:  # Very low overlap threshold
-                    success = False
-                    issues.append(f"Very low overlap: {overlap:.1f}%")
-                
-                if mean_dist > 2.0:  # Very large distance threshold
-                    success = False
-                    issues.append(f"Large mean distance: {mean_dist:.3f}m")
-                
-                if overlap < 50:  # Warning threshold
-                    issues.append(f"Low overlap: {overlap:.1f}%")
-                
-                if mean_dist > 1.0:  # Warning threshold
-                    issues.append(f"Large distance: {mean_dist:.3f}m")
-            
-            validation_results.append({
-                'image_id': cal_image_id,
-                'image_name': img_name,
-                'success': success,
-                'comparison_results': comparison_results,
-                'issues': issues,
-                'critical_failure': critical_failure
-            })
-            
-            if critical_failure:
-                overall_success = False
-                print(f"❌ CRITICAL VALIDATION FAILURE for {img_name}: {', '.join(issues)}")
-                break  # Stop validation immediately
-            elif not success:
-                overall_success = False
-                print(f"❌ Validation failed for {img_name}: {', '.join(issues)}")
-            else:
-                print(f"✅ Validation passed for {img_name}")
-                if issues:
-                    print(f"   Warnings: {', '.join(issues)}")
-        
-        except Exception as e:
-            print(f"❌ Error testing {img_name}: {e}")
-            validation_results.append({
-                'image_id': cal_image_id,
-                'image_name': img_name,
-                'success': False,
-                'error': str(e)
-            })
-            overall_success = False
-    
-    # Summary
-    print(f"\n" + "="*60)
-    print("📊 VALIDATION SUMMARY")
-    print("="*60)
-    
-    successful_tests = sum(1 for r in validation_results if r['success'])
-    total_tests = len(validation_results)
-    critical_failures = sum(1 for r in validation_results if r.get('critical_failure', False))
-    
-    print(f"Successful tests: {successful_tests}/{total_tests}")
-    if critical_failures > 0:
-        print(f"🚨 CRITICAL FAILURES: {critical_failures}")
-    
-    if critical_failures > 0:
-        print("\n🚨 CRITICAL VALIDATION FAILURE DETECTED!")
-        print("   A bug has been identified in the depth map generation or point cloud conversion.")
-        print("   The validation was stopped to prevent further issues.")
-        print("   You MUST fix this bug before continuing with any predictions.")
-        print("   Check the comparison results above for details on the specific issue.")
-    elif overall_success:
-        print("✅ All prior depthmap validations passed!")
-        print("   The prior depthmap generation process appears to be working correctly.")
-        print("   You can proceed with full MapAnything predictions.")
-    else:
-        print("❌ Some prior depthmap validations failed!")
-        print("   Issues detected in the prior depthmap generation process.")
-        print("   Please review the comparison results and fix issues before proceeding.")
-        
-        # Print detailed results
-        print("\nDetailed Results:")
-        for result in validation_results:
-            status = "✅ PASS" if result['success'] else "❌ FAIL"
-            print(f"  {status} {result['image_name']} (ID:{result['image_id']})")
-            if 'issues' in result and result['issues']:
-                for issue in result['issues']:
-                    print(f"    - {issue}")
-            if 'error' in result:
-                print(f"    - Error: {result['error']}")
-    
-    return overall_success
-
-
-def compute_point_to_point_distances(points1, points2):
-    """
-    Compute closest point-to-point distances between two point sets.
-    
-    Args:
-        points1: First set of 3D points (N1, 3)
-        points2: Second set of 3D points (N2, 3)
-        
-    Returns:
-        dict: Distance statistics
-    """
-    if len(points1) == 0 or len(points2) == 0:
-        return {
-            'mean_distance': float('inf'),
-            'median_distance': float('inf'),
-            'max_distance': float('inf'),
-            'min_distance': float('inf'),
-            'std_distance': float('inf')
-        }
-    
-    # Compute distances between all point pairs
-    distances = cdist(points1, points2)
-    
-    # Find minimum distances for each point in points1
-    min_distances = np.min(distances, axis=1)
-    
-    return {
-        'mean_distance': np.mean(min_distances),
-        'median_distance': np.median(min_distances),
-        'max_distance': np.max(min_distances),
-        'min_distance': np.min(min_distances),
-        'std_distance': np.std(min_distances)
-    }
-
-
-def compare_prior_depthmap_with_reference_points(reconstruction, reference_reconstruction, 
-                                                image_id, ref_image_id, target_size, 
-                                                output_folder=None, verbose=False):
-    """
-    Generate a prior depthmap from reference 3D points, convert it back to 3D points,
-    and compare with the original reference 3D points.
-    
-    Args:
-        reconstruction: ColmapReconstruction object (calibration reconstruction)
-        reference_reconstruction: ColmapReconstruction object (reference with 3D points)
-        image_id: Image ID in calibration reconstruction
-        ref_image_id: Image ID in reference reconstruction
-        target_size: Target image size for depth map
-        output_folder: Optional output folder for saving comparison results
-        verbose: If True, print detailed comparison information
-        
-    Returns:
-        dict: Comparison results including distance statistics
-    """
-    print(f"\n=== Comparing Prior Depthmap with Reference Points ===")
-    print(f"Calibration Image ID: {image_id}")
-    print(f"Reference Image ID: {ref_image_id}")
-    
-    # Get ground truth parameters for calibration image
-    camera = reconstruction.get_image_camera(image_id)
-    original_width, original_height = camera.width, camera.height
-    
-    # Get ground truth intrinsics and scale for target resolution
-    K = reconstruction.get_camera_calibration_matrix(image_id)
-    scale_x = target_size / original_width
-    scale_y = target_size / original_height
-    K_scaled = K.copy()
-    K_scaled[0, :] *= scale_x
-    K_scaled[1, :] *= scale_y
-    
-    # Get ground truth camera pose from calibration reconstruction
-    cal_cam_from_world = reconstruction.get_image_cam_from_world(image_id)
-    cal_pose_matrix = cal_cam_from_world.matrix()  # This is cam_from_world (3x4)
-    
-    # Get reference 3D points for this image
-    ref_points_3d, ref_points_2d, ref_point_ids = reference_reconstruction.get_visible_3d_points(
-        ref_image_id, min_track_length=2
-    )
-    
-    if len(ref_points_3d) == 0:
-        print("Error: No reference 3D points found")
-        return None
-    
-    print(f"Found {len(ref_points_3d)} reference 3D points")
-    
-    # Step 1: Generate prior depth map using the same function as the normal pipeline
-    # Since the poses are identical for matching images, we can use the calibration image's pose matrix
-    prior_depth, depth_range = compute_prior_depthmap(
-        reference_reconstruction=reference_reconstruction,
-        image_id=ref_image_id,
-        scaled_intrinsics=K_scaled,
-        pose_matrix=cal_pose_matrix,  # Use calibration image's pose matrix (should be same as reference)
-        target_size=target_size,
-        verbose=False,
-        output_folder=None
-    )
-    
-    if prior_depth is None or np.sum(prior_depth > 0) == 0:
-        print("Error: Could not generate prior depth map")
-        return None
-    
-    print(f"Generated prior depth map with {np.sum(prior_depth > 0)} valid pixels")
-    print(f"Depth range: {np.min(prior_depth[prior_depth > 0]):.3f} - {np.max(prior_depth[prior_depth > 0]):.3f}")
-    
-    # Step 2: Convert prior depth map back to 3D points using ground truth pose/intrinsics
-    # Create a dummy image for color information
-    dummy_image = np.ones((target_size, target_size, 3), dtype=np.float32) * 0.5
-    
-    # Convert depth map to point cloud using ground truth parameters
-    # Convert cam_from_world to cam2world for the function
-    pose_4x4 = np.eye(4)
-    pose_4x4[:3, :] = cal_pose_matrix
-    pose_4x4 = np.linalg.inv(pose_4x4)  # Convert cam_from_world to cam2world
-    
-    prior_points, prior_colors = compute_pointcloud_from_depthmap_groundtruth(
-        prior_depth, dummy_image, K_scaled, pose_4x4,
-        conf_threshold=0.0, max_points=None
-    )
-    
-    if len(prior_points) == 0:
-        print("Error: Could not generate point cloud from prior depth map")
-        return None
-    
-    print(f"Generated {len(prior_points)} points from prior depth map")
-    
-    # Step 3: Compare prior_points with original reference 3D points
-    print(f"Comparing {len(prior_points)} prior points with {len(ref_points_3d)} reference points...")
-    
-    # Compute point-to-point distances
-    distance_stats = compute_point_to_point_distances(prior_points, ref_points_3d)
-    
-    print(f"Distance Analysis:")
-    print(f"  Mean distance: {distance_stats['mean_distance']:.6f}m")
-    print(f"  Median distance: {distance_stats['median_distance']:.6f}m")
-    print(f"  Max distance: {distance_stats['max_distance']:.6f}m")
-    print(f"  Min distance: {distance_stats['min_distance']:.6f}m")
-    print(f"  Std distance: {distance_stats['std_distance']:.6f}m")
-    
-    # Check if distances are small (should be very close to zero for perfect reconstruction)
-    tolerance = 0.01  # 1cm tolerance
-    if distance_stats['mean_distance'] < tolerance:
-        print("✅ EXCELLENT: Mean distance is very small - depth map conversion is working correctly!")
-    elif distance_stats['mean_distance'] < 0.1:  # 10cm tolerance
-        print("✅ GOOD: Mean distance is small - depth map conversion is working well")
-    else:
-        print("⚠️  WARNING: Mean distance is large - potential issues in depth map conversion")
-        print("   Possible issues:")
-        print("   - Incorrect intrinsics scaling")
-        print("   - Depth map projection errors")
-        print("   - Point cloud conversion errors")
-    
-    # Prepare results
-    comparison_results = {
-        'prior_points_count': len(prior_points),
-        'reference_points_count': len(ref_points_3d),
-        'depth_map_valid_pixels': np.sum(prior_depth > 0),
-        'calibration_image_id': image_id,
-        'reference_image_id': ref_image_id,
-        'distance_statistics': distance_stats
-    }
-    
-    # Save comparison results if output folder provided
-    if output_folder is not None:
-        comparison_folder = os.path.join(output_folder, "prior_comparison")
-        os.makedirs(comparison_folder, exist_ok=True)
-        
-        # Save prior point cloud (from depth map)
-        if len(prior_points) > 0:
-            prior_pc = trimesh.PointCloud(vertices=prior_points, colors=(prior_colors * 255).astype(np.uint8))
-            prior_pc_path = os.path.join(comparison_folder, f"prior_points_{image_id}_{ref_image_id}.ply")
-            prior_pc.export(prior_pc_path)
-            print(f"Saved prior point cloud: {prior_pc_path}")
-        
-        # Save reference points (original 3D points)
-        if len(ref_points_3d) > 0:
-            ref_colors = np.ones((len(ref_points_3d), 3)) * [1, 0, 0]  # Red for reference
-            ref_pc = trimesh.PointCloud(vertices=ref_points_3d, colors=(ref_colors * 255).astype(np.uint8))
-            ref_pc_path = os.path.join(comparison_folder, f"reference_points_{image_id}_{ref_image_id}.ply")
-            ref_pc.export(ref_pc_path)
-            print(f"Saved reference points: {ref_pc_path}")
-        
-        # Save combined point cloud for visualization
-        if len(prior_points) > 0 and len(ref_points_3d) > 0:
-            combined_points = np.vstack([prior_points, ref_points_3d])
-            combined_colors = np.vstack([
-                prior_colors,
-                np.ones((len(ref_points_3d), 3)) * [1, 0, 0]  # Red for reference
-            ])
-            combined_pc = trimesh.PointCloud(vertices=combined_points, colors=(combined_colors * 255).astype(np.uint8))
-            combined_pc_path = os.path.join(comparison_folder, f"combined_{image_id}_{ref_image_id}.ply")
-            combined_pc.export(combined_pc_path)
-            print(f"Saved combined point cloud: {combined_pc_path}")
-    
-    return comparison_results
-
-
-def save_individual_pointclouds(batch_predictions, batch_image_ids, reconstruction, 
-                               reference_reconstruction, output_folder, max_points, device="cuda"):
-    """
-    Save individual prior and predicted point clouds for each image in the batch.
-    
-    Args:
-        batch_predictions: List of prediction dictionaries
-        batch_image_ids: List of COLMAP image IDs
-        reconstruction: ColmapReconstruction object
-        reference_reconstruction: Reference reconstruction object
-        output_folder: Output folder path
-        max_points: Maximum total points (will be divided among images)
-        device: Device to place tensors on
-    """
-    # Build image name mapping for reference reconstruction if available
-    image_name_mapping = build_image_name_mapping(
-        reconstruction, reference_reconstruction, batch_image_ids
-    )
-    
-    max_points_per_image = max_points // len(batch_image_ids)
-    
-    for view_idx, pred in enumerate(batch_predictions):
-        image_id = batch_image_ids[view_idx]
-        img_name = reconstruction.get_image_name(image_id)
-        
-        # Process point clouds for this image
-        pred_points, pred_colors, prior_points, prior_colors = process_single_image_pointclouds(
-            pred, image_id, reconstruction, reference_reconstruction, 
-            image_name_mapping, max_points_per_image, device
-        )
-        
-        # Save predicted point cloud
-        if pred_points is not None and len(pred_points) > 0:
-            save_single_pointcloud(pred_points, pred_colors, image_id, img_name, 
-                                 "predicted", output_folder)
-        else:
-            print(f"Warning: No predicted points for image {img_name} (ID:{image_id})")
-        
-        # Save prior point cloud if available and run comparison
-        if prior_points is not None and len(prior_points) > 0:
-            save_single_pointcloud(prior_points, prior_colors, image_id, img_name, 
-                                 "prior", output_folder)
-        elif reference_reconstruction is not None:
-            print(f"Warning: No prior points for image {img_name} (ID:{image_id})")
-
-
-def split_into_batches_smart(reconstruction, image_ids, batch_size):
-    """
-    Split image IDs into batches using COLMAP reconstruction quality metrics.
-    Each batch consists of a reference image and its best partner images.
-    Once images are used in a batch, they cannot be reference images for future batches.
-    
-    Args:
-        reconstruction: ColmapReconstruction object
-        image_ids: List of image IDs
-        batch_size: Maximum number of images per batch
-        
-    Returns:
-        List of batches, where each batch is a list of image IDs
-    """
-    batches = []
-    used_as_reference = set()  # Images that have been used as reference images
-    
-    # Sort image IDs for consistent processing order
-    remaining_candidates = sorted(image_ids)
-    
-    print(f"Creating smart batches with geometric relationships...")
-    
-    while len(used_as_reference) < len(image_ids):
-        # Find next unused reference image
-        reference_image = None
-        for img_id in remaining_candidates:
-            if img_id not in used_as_reference:
-                reference_image = img_id
-                break
-        
-        if reference_image is None:
-            break
-            
-        # Find best partner images for this reference
-        try:
-            # Ensure image point mappings are built
-            reconstruction._ensure_image_point_maps()
-            
-            best_partners = reconstruction._find_best_partner_for_image(
-                reference_image, 
-                min_points=50,  # Lower threshold for more flexibility
-                parallax_sample_size=50
-            )
-            
-            # Filter out invalid partners (-1) and create batch
-            valid_partners = [pid for pid in best_partners if pid != -1 and pid in image_ids]
-            
-            # Start batch with reference image
-            batch = [reference_image]
-            
-            # Add best partners up to batch_size
-            for partner in valid_partners:
-                if len(batch) >= batch_size:
-                    break
-                if partner not in batch:  # Avoid duplicates
-                    batch.append(partner)
-            
-            # If batch is too small, fill with any remaining images that haven't been references
-            if len(batch) < batch_size:
-                for img_id in remaining_candidates:
-                    if len(batch) >= batch_size:
-                        break
-                    if img_id not in batch and img_id not in used_as_reference:
-                        batch.append(img_id)
-            
-            batches.append(batch)
-            
-            # Mark ALL images in this batch as used (cannot be reference images anymore)
-            for img_id in batch:
-                used_as_reference.add(img_id)
-            
-            print(f"Batch {len(batches)}: Reference {reference_image} with {len(batch)-1} partners: {batch[1:]}")
-            print(f"  Marked {len(batch)} images as used: {batch}")
-            
-        except Exception as e:
-            print(f"Error: Could not find partners for image {reference_image}: {e}")
-            # Mark this image as used and continue
-            used_as_reference.add(reference_image)
-            continue
-    
-    # Check if any images were missed (shouldn't happen with the new logic)
-    all_batched_images = set()
-    for batch in batches:
-        all_batched_images.update(batch)
-    
-    remaining_unprocessed = [img_id for img_id in image_ids if img_id not in all_batched_images]
-    
-    if remaining_unprocessed:
-        print(f"Warning: {len(remaining_unprocessed)} images not included in any batch: {remaining_unprocessed}")
-        # Add them as a final batch
-        batches.append(remaining_unprocessed)
-        print(f"Final batch {len(batches)}: Remaining images {remaining_unprocessed}")
-    
-    print(f"Created {len(batches)} smart batches with geometric relationships")
-    print(f"Total images processed: {len(all_batched_images)}/{len(image_ids)}")
-    return batches
-
-
-def split_into_batches(image_ids, batch_size):
-    """
-    Simple sequential split into batches (fallback method).
-    
-    Args:
-        image_ids: List of image IDs
-        batch_size: Maximum number of images per batch
-        
-    Returns:
-        List of batches, where each batch is a list of image IDs
-    """
-    batches = []
-    for i in range(0, len(image_ids), batch_size):
-        batch = image_ids[i:i + batch_size]
-        batches.append(batch)
-    return batches
-
-
-def save_batch_pointcloud(points_3d, colors, batch_idx, temp_dir):
-    """
-    Save a batch point cloud to a temporary file.
-    
-    Args:
-        points_3d: 3D points array
-        colors: Colors array
-        batch_idx: Batch index for filename
-        temp_dir: Temporary directory path
-        
-    Returns:
-        Path to saved point cloud file
-    """
-    if len(points_3d) == 0:
-        return None
-    
-    # Convert colors to uint8 for PLY format
-    colors_uint8 = (colors * 255).astype(np.uint8)
-    
-    # Create and save point cloud
-    point_cloud = trimesh.PointCloud(vertices=points_3d, colors=colors_uint8)
-    
-    batch_filename = f"batch_{batch_idx:03d}.ply"
-    batch_path = os.path.join(temp_dir, batch_filename)
-    point_cloud.export(batch_path)
-    
-    print(f"Saved batch {batch_idx} with {len(points_3d)} points to {batch_filename}")
-    return batch_path
-
-
-def merge_pointclouds_with_open3d(batch_files, output_path, max_points=None):
-    """
-    Merge multiple point cloud files into a single point cloud using Open3D.
-    
-    Args:
-        batch_files: List of paths to batch point cloud files
-        output_path: Path for the final merged point cloud
-        max_points: Optional maximum number of points to keep after merging
-    """
-    print(f"Merging {len(batch_files)} point cloud batches...")
-    
-    merged_points = []
-    merged_colors = []
-    
-    for batch_file in batch_files:
-        if batch_file is None:
-            continue
-            
-        # Load point cloud with Open3D
-        pcd = o3d.io.read_point_cloud(batch_file)
-        
-        if len(pcd.points) == 0:
-            continue
-            
-        # Extract points and colors
-        points = np.asarray(pcd.points)
-        colors = np.asarray(pcd.colors)
-        
-        merged_points.append(points)
-        merged_colors.append(colors)
-        
-        print(f"Loaded {len(points)} points from {os.path.basename(batch_file)}")
-    
-    if len(merged_points) == 0:
-        raise ValueError("No valid point clouds found to merge")
-    
-    # Concatenate all points and colors
-    all_points = np.concatenate(merged_points, axis=0)
-    all_colors = np.concatenate(merged_colors, axis=0)
-    
-    print(f"Total points before subsampling: {len(all_points)}")
-    
-    # Subsample if necessary
-    if max_points is not None and len(all_points) > max_points:
-        print(f"Subsampling from {len(all_points)} to {max_points} points...")
-        indices = np.random.choice(len(all_points), max_points, replace=False)
-        all_points = all_points[indices]
-        all_colors = all_colors[indices]
-    
-    # Create final point cloud
-    final_pcd = o3d.geometry.PointCloud()
-    final_pcd.points = o3d.utility.Vector3dVector(all_points)
-    final_pcd.colors = o3d.utility.Vector3dVector(all_colors)
-    
-    # Save merged point cloud
-    o3d.io.write_point_cloud(output_path, final_pcd)
-    
-    print(f"Successfully saved merged point cloud with {len(all_points)} points to {output_path}")
-    return len(all_points)
 
 
 def main():
@@ -2192,26 +1324,6 @@ def main():
     else:
         global_image_name_mapping = {}
     
-    # Validate prior depthmaps only if explicitly requested
-    if args.validate_prior_only:
-        if reference_reconstruction is None:
-            print("\n❌ Error: --validate_prior_only requires --reference_reconstruction to be provided")
-            return
-            
-        print("\n🔍 Running prior depthmap validation...")
-        validation_success = validate_prior_depthmaps(
-            reconstruction, reference_reconstruction, all_image_ids, 
-            args.resolution, args.output_folder
-        )
-        
-        if validation_success:
-            print("\n✅ Prior depthmap validation completed successfully!")
-            print("   You can now run the full prediction pipeline.")
-            return
-        else:
-            print("\n❌ Prior depthmap validation failed!")
-            print("   Please fix the issues before running full predictions.")
-            return
     
     # Choose batching strategy
     use_smart_batching = args.smart_batching and not args.sequential_batching
@@ -2266,80 +1378,9 @@ def main():
                 args.output_folder, device=device, target_size=args.resolution, prior_depths=batch_prior_depths
             )
 
-            if args.verbose:
-
-                # Extract point cloud from batch predictions using ground truth parameters
-                batch_points_3d, batch_colors = extract_point_cloud_from_predictions(
-                    batch_predictions, reconstruction, batch_image_ids_loaded, 
-                    args.conf_threshold, args.max_points, use_groundtruth=True, device=device
-                )
-          
-                # Save batch point cloud
-                if len(batch_points_3d) > 0:
-                    batch_file = save_batch_pointcloud(
-                        batch_points_3d, batch_colors, batch_idx, args.output_folder
-                    )
-                    batch_files.append(batch_file)
-                else:
-                    print(f"Warning: Batch {batch_idx} produced no points")
-                    batch_files.append(None)
-            
-                # Save individual prior and predicted point clouds for each image in the batch
-                if args.verbose and args.output_folder is not None:
-                    save_individual_pointclouds(
-                        batch_predictions, batch_image_ids_loaded, reconstruction, 
-                        reference_reconstruction, args.output_folder, args.max_points, device
-                    )
-            
-                del batch_points_3d, batch_colors
-
             # Clear GPU memory
             del batch_images, batch_predictions
             torch.cuda.empty_cache()
-
-        if args.verbose:
-            # Filter out None batch files
-            valid_batch_files = [f for f in batch_files if f is not None]
-            if len(valid_batch_files) == 0:
-                print("Error: No valid point clouds generated from any batch. Try lowering the confidence threshold.")
-                return
-            # Merge all batch point clouds
-            print(f"\n--- Merging {len(valid_batch_files)} batch point clouds ---")
-            total_points = merge_pointclouds_with_open3d(
-                valid_batch_files, final_pointcloud_path, args.max_points
-            )
-            
-            print(f"Successfully created final point cloud with {total_points} points at {final_pointcloud_path}")
-
-        # Generate point cloud from NPZ files for verification
-        print("\n=== Generating Point Cloud from NPZ Files for Verification ===")
-        depth_maps_folder = os.path.join(args.output_folder, "depth_maps")
-        
-        if os.path.exists(depth_maps_folder):
-            print(f"Loading NPZ files from: {depth_maps_folder}")
-            
-            # Load all NPZ files and generate point cloud
-            npz_points, npz_colors, npz_metadata = load_multiple_npz_and_generate_pointclouds(
-                depth_maps_folder, 
-                conf_threshold=0.0,  # No confidence filtering for verification
-                max_points_per_file=100000,  # Limit per file to avoid memory issues
-                max_total_points=10000000  # Total limit
-            )
-            
-            if len(npz_points) > 0:
-                # Save NPZ-generated point cloud
-                npz_cloud_path = os.path.join(args.output_folder, "npz_cloud.ply")
-                
-                # Create point cloud using trimesh
-                npz_pc = trimesh.PointCloud(vertices=npz_points, colors=(npz_colors * 255).astype(np.uint8))
-                npz_pc.export(npz_cloud_path)
-                
-                print(f"✅ Saved NPZ-generated point cloud: {npz_cloud_path} ({len(npz_points)} points)")
-                print(f"   Generated from {len(npz_metadata)} NPZ files")
-            else:
-                print("❌ No valid point clouds generated from NPZ files")
-        else:
-            print(f"❌ Depth maps folder not found: {depth_maps_folder}")
 
     finally:
         print("Processing complete!")

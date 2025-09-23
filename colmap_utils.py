@@ -15,7 +15,7 @@ import random
 import pycolmap
 from typing import Optional, Dict, Set, Tuple, List
 from tqdm import tqdm
-
+import os
 
 class ColmapReconstruction:
     """
@@ -45,7 +45,26 @@ class ColmapReconstruction:
         
         # Cached bounding box computation
         self._bbox_cache = {}
-    
+
+        # cached image name mapping
+        self._image_folder = ""
+        self._image_name_id_mapping = {}
+        for image in self.reconstruction.images.values():
+            self._image_name_id_mapping[image.name] = image.image_id
+            if self._image_folder == "":
+                self._image_folder = os.path.dirname(image.name)
+
+    def get_image_folder(self) -> str:
+        return self._image_folder
+
+    def get_image_id_from_name(self, image_name: str) -> int:
+        if image_name not in self._image_name_id_mapping:
+            raise ValueError(f"Image name {image_name} not found in reconstruction")
+        return self._image_name_id_mapping[image_name]
+
+    def has_image_name(self, image_name: str) -> bool:
+        return image_name in self._image_name_id_mapping
+
     def _ensure_image_point_maps(self):
         """Lazily build image-to-point mappings if not already cached."""
         if self._image_point3D_ids is None or self._image_point3D_xy is None:
@@ -132,10 +151,10 @@ class ColmapReconstruction:
         return np.mean(parallax_angles)
     
    
-    def _find_best_partner_for_image(self, image_id: int, min_points: int = 100, 
+    def find_best_partner_for_image(self, image_id: int, min_points: int = 100, 
                                    parallax_sample_size: int = 100) -> List[int]:
         """
-        Internal function to find the best partners for a given image.
+        Function to find the best partners for a given image.
         
         Args:
             image_id: ID of the image to find a partner for
@@ -315,7 +334,6 @@ class ColmapReconstruction:
         
         return bbox_min, bbox_max
     
-
     # Accessor methods for clean API
     def has_image(self, image_id: int) -> bool:
         """Check if an image ID exists in the reconstruction."""
@@ -391,7 +409,11 @@ class ColmapReconstruction:
         ])
         
         return dist_dict, dist_coeffs
-    
+
+    def get_image_ids_with_valid_points(self) -> List[int]:
+        """Get list of image IDs with valid points."""
+        return [image_id for image_id in self.reconstruction.images.keys() if image_id in self._image_point3D_ids]
+
     def get_visible_3d_points(self, image_id: int, min_track_length: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Get 3D points visible in the specified image with optional track length filtering.
@@ -536,119 +558,44 @@ def load_reconstruction(reconstruction_path):
         raise ValueError(f"Failed to load COLMAP reconstruction from {reconstruction_path}: {e}")
 
 
-def find_image_match(source_reconstruction, target_reconstruction, source_image_id, pose_tolerance_rotation=0.1, pose_tolerance_translation=0.1, verbose=False):
+def find_exact_image_match(source_reconstruction, target_reconstruction, source_image_id):
     """
-    Find the match of a single image from source reconstruction in target reconstruction.
-    Searches for potential matches using multiple criteria and returns the one with the best camera pose match.
-    
-    Args:
-        source_reconstruction: ColmapReconstruction object (source/calibration reconstruction)
-        target_reconstruction: ColmapReconstruction object (target/reference reconstruction)
-        source_image_id: Image ID from source reconstruction to find match for
-        pose_tolerance_rotation: Maximum allowed rotation angle difference (default: 0.1 radians ≈ 5.7 degrees)
-        pose_tolerance_translation: Maximum allowed difference in translation vectors (default: 0.1 meters)
-        verbose: Whether to print matching information
-        
-    Returns:
-        dict: {
-            'target_image_id': target image ID if found (None if no match),
-            'image_name': name of the image,
-            'match_found': boolean indicating if a match was found,
-            'pose_status': status string describing pose comparison,
-            'rotation_angle': rotation angle difference in radians (None if no match),
-            'translation_diff': translation difference in meters (None if no match),
-            'poses_compatible': boolean indicating if poses are within tolerance,
-            'match_method': string describing how the match was found
-        }
+    Find the exact match of a single image from source reconstruction in target reconstruction.
     """
-    import os
-    
-    # Check if source image exists
+
     if not source_reconstruction.has_image(source_image_id):
-        if verbose:
-            print(f"Source image ID {source_image_id} not found in source reconstruction")
-        return {
-            'target_image_id': None,
-            'image_name': None,
-            'match_found': False,
-            'pose_status': "Source image not found",
-            'rotation_angle': None,
-            'translation_diff': None,
-            'poses_compatible': False,
-            'match_method': None
-        }
-    
-    # Get image name and extract filename from source reconstruction
-    source_img_name = source_reconstruction.get_image_name(source_image_id)
-    source_filename = os.path.basename(source_img_name)  # Extract just the filename without path
-    
-    if verbose:
-        print(f"Searching for match for '{source_img_name}' (filename: '{source_filename}', ID: {source_image_id})")
-    
+        raise ValueError(f"Source image ID {source_image_id} not found in source reconstruction")
+
+    source_image_name = source_reconstruction.get_image_name(source_image_id)
+    source_filename = os.path.basename(source_image_name)  # Extract just the filename without path
+
     # Get source camera pose for comparison
     source_pose = source_reconstruction.get_image_cam_from_world(source_image_id)
     source_R = source_pose.rotation.matrix()
     source_t = source_pose.translation
     
-    # Collect all potential candidate matches
     candidates = []
-    
-    # Method 1: Exact name match
-    # Method 2: Filename match (ignoring path)
-    # Method 3: Same image ID
-    for target_img_id in target_reconstruction.get_all_image_ids():
-        target_img_name = target_reconstruction.get_image_name(target_img_id)
-        target_filename = os.path.basename(target_img_name)
-        
-        match_method = None
-        
-        # Check for exact name match
-        if source_img_name == target_img_name:
-            match_method = "exact_name"
-        # Check for filename match (ignoring path differences)
-        elif source_filename == target_filename:
-            match_method = "filename"
-        # Check for same image ID
-        elif source_image_id == target_img_id:
-            match_method = "same_id"
-        
-        if match_method:
-            candidates.append((target_img_id, target_img_name, match_method))
-    
+    # check if source image name exists in target reconstruction
+    if target_reconstruction.has_image_name(source_image_name):
+        candidates.append(target_reconstruction.get_image_id_from_name(source_image_name))
+
+    # check if source image id exists in target reconstruction (they could be in different folders)
+    if target_reconstruction.has_image_name(source_filename):
+        candidates.append(target_reconstruction.get_image_id_from_name(source_filename))
+
+    # check if source image name exists in target reconstruction (they could be in different folders)
+    tfile = os.path.join(target_reconstruction.get_image_folder(), source_filename)
+    if target_reconstruction.has_image_name(tfile):
+        candidates.append(target_reconstruction.get_image_id_from_name(tfile))
+
     if not candidates:
-        if verbose:
-            print(f"  No candidates found (no exact name, filename, or ID matches)")
-        return {
-            'target_image_id': None,
-            'image_name': source_img_name,
-            'match_found': False,
-            'pose_status': "No potential matches found",
-            'rotation_angle': None,
-            'translation_diff': None,
-            'poses_compatible': False,
-            'match_method': None
-        }
-    
-    if verbose:
-        print(f"  Found {len(candidates)} potential candidates:")
-        for target_id, target_name, method in candidates:
-            print(f"    {target_name} (ID: {target_id}) - matched by {method}")
-    
-    # Evaluate pose similarity for all candidates
-    best_candidate = None
-    best_pose_score = float('inf')  # Lower is better (rotation_angle + normalized_translation_diff)
-    best_rotation_angle = None
-    best_translation_diff = None
-    best_match_method = None
-    
-    candidate_results = []
-    
-    for target_img_id, target_img_name, match_method in candidates:
-        # Get target camera pose
-        target_pose = target_reconstruction.get_image_cam_from_world(target_img_id)
-        target_R = target_pose.rotation.matrix()
-        target_t = target_pose.translation
-        
+        return None
+
+    for cid in candidates:
+        tpose = target_reconstruction.get_image_cam_from_world(cid)
+        target_R = tpose.rotation.matrix()
+        target_t = tpose.translation
+
         # Compare rotation matrices using relative rotation R1^T * R2
         R_rel = source_R.T @ target_R
         trace_R = np.trace(R_rel)
@@ -658,67 +605,29 @@ def find_image_match(source_reconstruction, target_reconstruction, source_image_
         
         # Compare translation vectors using L2 norm
         translation_diff = np.linalg.norm(source_t - target_t)
-        
-        # Combine rotation and translation for overall pose score
-        # Normalize translation to roughly same scale as rotation (assuming ~1m translation ≈ 1 radian)
-        pose_score = rotation_angle + translation_diff
-        
-        candidate_results.append({
-            'target_id': target_img_id,
-            'target_name': target_img_name,
-            'match_method': match_method,
-            'rotation_angle': rotation_angle,
-            'translation_diff': translation_diff,
-            'pose_score': pose_score
-        })
-        
-        if verbose:
-            rotation_degrees = np.degrees(rotation_angle)
-            print(f"    {target_img_name}: rot={rotation_angle:.4f} rad ({rotation_degrees:.1f}°), trans={translation_diff:.4f} m, score={pose_score:.4f}")
-        
-        # Track the best candidate
-        if pose_score < best_pose_score:
-            best_pose_score = pose_score
-            best_candidate = target_img_id
-            best_rotation_angle = rotation_angle
-            best_translation_diff = translation_diff
-            best_match_method = match_method
+
+        if rotation_angle < 1e-6 and translation_diff < 1e-6:
+            return cid
+
+    return None
+
+def build_image_id_mapping(source_reconstruction, target_reconstruction, source_image_ids=None):
+    """
+    Build mapping between source and target image IDs for reference reconstruction.
     
-    # Determine pose status and compatibility for the best candidate
-    poses_compatible = (best_rotation_angle < pose_tolerance_rotation and 
-                       best_translation_diff < pose_tolerance_translation)
-    
-    if best_rotation_angle < 1e-6 and best_translation_diff < 1e-6:
-        pose_status = "✓ Identical"
-    elif poses_compatible:
-        pose_status = f"⚠ Close (rot: {best_rotation_angle:.6f} rad, trans: {best_translation_diff:.6f} m)"
-    else:
-        rotation_degrees = np.degrees(best_rotation_angle)
-        pose_status = f"❌ Different (rot: {best_rotation_angle:.3f} rad ({rotation_degrees:.1f}°), trans: {best_translation_diff:.3f} m)"
-    
-    if verbose:
-        best_target_name = next(r['target_name'] for r in candidate_results if r['target_id'] == best_candidate)
-        print(f"  → Best match: {best_target_name} (ID: {best_candidate}) via {best_match_method}")
-        print(f"  → Pose: {pose_status}")
-        print(f"  → Compatible: {'Yes' if poses_compatible else 'No'}")
+    Args:
+        source_reconstruction: Source ColmapReconstruction object
+        target_reconstruction: Target ColmapReconstruction object
+        source_image_ids: List of image IDs to map in source reconstruction, if None, all images in source reconstruction will be mapped
         
-        if not poses_compatible:
-            # Show camera centers for debugging
-            source_center = source_reconstruction.get_camera_center(source_image_id)
-            target_center = target_reconstruction.get_camera_center(best_candidate)
-            center_diff = np.linalg.norm(source_center - target_center)
-            
-            print(f"  → Source camera center: [{source_center[0]:.3f}, {source_center[1]:.3f}, {source_center[2]:.3f}]")
-            print(f"  → Target camera center: [{target_center[0]:.3f}, {target_center[1]:.3f}, {target_center[2]:.3f}]")
-            print(f"  → Camera center distance: {center_diff:.3f} meters")
-    
-    return {
-        'target_image_id': best_candidate,
-        'image_name': source_img_name,
-        'match_found': True,
-        'pose_status': pose_status,
-        'rotation_angle': best_rotation_angle,
-        'translation_diff': best_translation_diff,
-        'poses_compatible': poses_compatible,
-        'match_method': best_match_method
-    } 
+    Returns:
+        dict: Mapping from source image_id to target image_id (or None if no match)
+    """
+
+    if source_image_ids is None:
+        source_image_ids = source_reconstruction.get_all_image_ids()
+
+    source_to_target_image_id_mapping = {}
+    for img_id in source_image_ids:
+        source_to_target_image_id_mapping[img_id] = find_exact_image_match(source_reconstruction, target_reconstruction, img_id)
+    return source_to_target_image_id_mapping
