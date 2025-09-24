@@ -194,3 +194,9 @@ def save_point_cloud(pts, colors, save_path):
     pcd.points = o3d.utility.Vector3dVector(pts)
     pcd.colors = o3d.utility.Vector3dVector(colors)
     o3d.io.write_point_cloud(save_path, pcd)
+
+def subsample_point_cloud(pts, colors, num_points):
+    if len(pts) < num_points:
+        return pts, colors
+    indices = np.random.choice(len(pts), num_points, replace=False)
+    return pts[indices], colors[indices]

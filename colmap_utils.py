@@ -152,7 +152,7 @@ class ColmapReconstruction:
         return np.mean(parallax_angles)
     
    
-    def find_best_partner_for_image(self, image_id: int, min_points: int = 100, 
+    def find_best_partners_for_image(self, image_id: int, min_points: int = 100, 
                                    parallax_sample_size: int = 100) -> List[int]:
         """
         Function to find the best partners for a given image.
@@ -243,7 +243,7 @@ class ColmapReconstruction:
         image_list = list(self.reconstruction.images.values())
         for image in tqdm(image_list, desc="Selecting image pairs", unit="img"):
             # Find the best partners for this image using the extracted function
-            best_partner_ids = self._find_best_partner_for_image(
+            best_partner_ids = self.find_best_partners_for_image(
                 image_id=image.image_id,
                 min_points=min_points,
                 parallax_sample_size=parallax_sample_size

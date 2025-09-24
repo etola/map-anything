@@ -189,11 +189,7 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         depth_map = prediction['depth_z'].cpu().numpy()  # (H, W) or (1, H, W, 1)
         confidence_map = prediction['conf'].cpu().numpy()  # (H, W) or (1, H, W, 1)
         depth_problem.update_depth_data(image_id, depth_map, confidence_map)
-        depth_problem.save_depth_data(image_id)
-
-        if verbose:
-            depth_problem.save_heatmap(image_id, what_to_save="all")
-            depth_problem.save_point_cloud(image_id)
+    print(f"    Updating depth maps for {len(predictions)} predictions - done")
         
     del predictions
 
@@ -239,7 +235,10 @@ def main():
             run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
             # Clear GPU memory
             torch.cuda.empty_cache()
+        break
         
+    densification_problem.compute_consistency()
+    densification_problem.save_results()
 
 
 if __name__ == "__main__":

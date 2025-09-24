@@ -11,7 +11,7 @@ import open3d as o3d
 
 from typing import List
 
-from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud
+from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap
 
 class DensificationProblem:
     """
@@ -24,6 +24,7 @@ class DensificationProblem:
         'depth_map'             : depth_map in target_size x target_size or None,
         'confidence_map'        : confidence_map in target_size x target_size or None,
         'prior_depth_map'       : prior depth map in target_size x target_size or None,
+        'consistency_map'       : consistency map of the estimated depth map with the partner images map in target_size x target_size or None,
         'depth_range'           : (min_depth, max_depth) tuple for consistent scaling, or None if no valid depths,
         'confidence_range'      : (min_confidence, max_confidence) tuple for consistent scaling, or None if no valid confidences,
         'camera_intrinsics'     : K_scaled,  # scaled intrinsics for target_size x target_size image
@@ -74,6 +75,14 @@ class DensificationProblem:
         self.active_image_ids = self.reconstruction.get_all_image_ids()
         self.source_to_target_image_id_mapping = {}
 
+        # parameters for fusion
+        self.fusion_max_partners = 8
+        self.fusion_min_points = 50
+        self.fusion_parallax_sample_size = 50
+        self.fusion_consistency_threshold = 0.05
+        self.fusion_min_consistency_count = 2
+
+
     def clear(self) -> None:
         self.scene_depth_data = {}
         self.active_image_ids = self.reconstruction.get_all_image_ids()
@@ -109,6 +118,7 @@ class DensificationProblem:
             'depth_map': None,
             'confidence_map': None,
             'prior_depth_map': None,
+            'consistency_map': None,
             'depth_range': None,
             'confidence_range': None,
             'camera_intrinsics': K_scaled,  # Use scaled intrinsics
@@ -231,15 +241,18 @@ class DensificationProblem:
         filepath = os.path.join(self.depth_data_folder, f"depth_{image_id:06d}.npz")
         self.scene_depth_data[image_id] = np.load(filepath)
 
-    def get_point_cloud(self, image_id: int, max_points: int = 1000000, conf_threshold: float = 0.0) -> tuple:
+    def get_point_cloud(self, image_id: int, conf_threshold: float=0.0, consistency_threshold: int=0, get_color: bool = True) -> tuple:
         depth_data = self.get_depth_data(image_id)
 
         depth_map = depth_data['depth_map']  # (H, W)
+
+        if depth_map is None:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+
         confidence_map = depth_data['confidence_map']  # (H, W)
+        consistency_map = depth_data['consistency_map']  # (H, W)
         camera_intrinsics = depth_data['camera_intrinsics']  # (3, 3) - scaled intrinsics
         cam_from_world = depth_data['camera_pose']  # (4, 4) - camera_from_world pose
-        image_id = depth_data['image_id']
-        image_name = depth_data['image_name']
         scaled_image = depth_data['scaled_image']
         
         # Filter by confidence threshold
@@ -251,33 +264,39 @@ class DensificationProblem:
         else:
             depth_map_filtered = depth_map
 
+        # Filter by consistency threshold
+        if consistency_threshold > 0 and consistency_map is not None:
+            valid_mask = consistency_map >= consistency_threshold
+            depth_map_filtered = depth_map_filtered[valid_mask]
+            print(f"Filtered by consistency >= {consistency_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map_filtered.shape)} pixels")
+
+        if depth_map_filtered is None:
+            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+
         # Check if we have valid depth values
         if np.max(depth_map_filtered) == 0:
             print("Warning: No valid depth values after filtering")
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
         
-        # Compute 3D points from depth using the saved camera parameters (numpy implementation)
-        pts3d_np, valid_mask_np = depthmap_to_world_frame(depth_map_filtered, camera_intrinsics, cam_from_world)
+        # Compute 3D points from depth using the saved camera parameters
+        pts3d, valid_mask = depthmap_to_world_frame(depth_map_filtered, camera_intrinsics, cam_from_world)
 
-        if not valid_mask_np.any():
+        if not valid_mask.any():
             print("Warning: No valid points found in depth map")
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
 
         # Extract valid points
-        valid_pts = pts3d_np[valid_mask_np]
+        pts3d = pts3d[valid_mask]
 
-        colors = np.ones((len(valid_pts), 3), dtype=np.float32) * 0.5  # Gray color
-        if scaled_image is not None:
-            simg_array = np.array(scaled_image, dtype=np.float32) / 255.0  # Shape: (518, 518, 3)
-            colors = simg_array[valid_mask_np]  # Shape: (N_valid_pixels, 3)
+        if get_color:
+            colors = np.ones((len(pts3d), 3), dtype=np.float32) * 0.5  # Gray color
+            if scaled_image is not None:
+                simg_array = np.array(scaled_image, dtype=np.float32) / 255.0  # Shape: (518, 518, 3)
+                colors = simg_array[valid_mask]  # Shape: (N_valid_pixels, 3)
+        else:
+            colors = None
 
-        # Subsample if max_points is specified
-        if max_points is not None and len(valid_pts) > max_points:
-            indices = np.random.choice(len(valid_pts), max_points, replace=False)
-            valid_pts = valid_pts[indices]
-            colors = colors[indices]
-
-        return valid_pts, colors
+        return pts3d, colors, valid_mask
 
     def get_batches_geometric(self, batch_size: int) -> List[List[int]]:
         """
@@ -314,7 +333,7 @@ class DensificationProblem:
             if reference_image_id is None:
                 break
 
-            best_partners = self.reconstruction.find_best_partner_for_image(
+            best_partners = self.reconstruction.find_best_partners_for_image(
                 reference_image_id, 
                 min_points=50,  # Lower threshold for more flexibility
                 parallax_sample_size=50
@@ -395,11 +414,71 @@ class DensificationProblem:
             depth_rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
             conf_rgb  = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
             prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
+            consistency_rgb = colorize_heatmap(depth_data['consistency_map'], data_range=(0, self.fusion_min_consistency_count)) if depth_data['consistency_map'] is not None else empty
 
-            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb], axis=1)
+            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb, consistency_rgb], axis=1)
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
-    def save_point_cloud(self, image_id: int, save_path: str = None) -> None:
-        pts, colors = self.get_point_cloud(image_id)
-        pc_path = save_path if save_path is not None else os.path.join(self.cloud_folder, f"pointcloud_{image_id:06d}.ply")
+    def save_cloud(self, image_id: int, consistent_points: bool = False, file_name: str = None) -> None:
+        pts, colors, _ = self.get_point_cloud(image_id, consistency_threshold=self.fusion_min_consistency_count if consistent_points else 0)
+        if file_name is None:
+            file_name = f"pointcloud_{image_id:06d}.ply"
+        pc_path = os.path.join(self.cloud_folder, file_name)
         save_point_cloud(pts, colors, pc_path)
+
+    def find_best_partners_for_image(self, ref_image_id: int) -> List[int]:
+        partner_image_ids = self.reconstruction.find_best_partners_for_image(
+            image_id=ref_image_id,
+            min_points=self.fusion_min_points,
+            parallax_sample_size=self.fusion_parallax_sample_size
+        )
+        if len(partner_image_ids) == 0:
+            return []
+        valid_partners = [pid for pid in partner_image_ids if pid in self.active_image_ids]
+        return valid_partners[:self.fusion_max_partners]
+
+    def compute_consistency_image(self, image_id: int):
+        partner_image_ids = self.find_best_partners_for_image(image_id)
+        depth_data = self.get_depth_data(image_id)
+        if depth_data['depth_map'] is None:
+            return
+
+        depth_map = depth_data['depth_map']
+        consistency_map = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
+
+        points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
+        for partner_id in partner_image_ids:
+            cmap_partner = self.compute_consistency_map(points_3d, valid_mask, partner_id)
+            consistency_map += cmap_partner
+        depth_data['consistency_map'] = consistency_map
+
+
+    def compute_consistency_map(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
+        partner_depth_data = self.get_depth_data(partner_id)
+        partner_depth_map = partner_depth_data['depth_map']
+        if partner_depth_map is None:
+            return np.zeros((self.target_size, self.target_size), dtype=np.float32)
+
+        partner_intrinsics = partner_depth_data['camera_intrinsics']
+        partner_pose = partner_depth_data['camera_pose']
+
+        projected_depth_map = compute_depthmap(points_3d, partner_intrinsics, partner_pose, self.target_size)
+        valid_mask = valid_mask & (projected_depth_map > 0)
+
+        # compare the partner depth map with the projected depth map and compute the consistency map at valid_mask locations
+        # if the difference is less than the consistency threshold, then the point is consistent and the consistency map is 1
+        # otherwise the consistency map is 0
+        consistency_map = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+        consistency_map[valid_mask] = np.abs(partner_depth_map[valid_mask] - projected_depth_map[valid_mask]) / projected_depth_map[valid_mask] < self.fusion_consistency_threshold
+        return consistency_map
+
+    def compute_consistency(self) -> None:
+        for image_id in tqdm(self.active_image_ids, desc="Computing consistency", unit="image"):
+            self.compute_consistency_image(image_id)
+
+    def save_results(self) -> None:
+        for image_id in tqdm(self.active_image_ids, desc="Saving results", unit="image"):
+            self.save_depth_data(image_id)
+            self.save_heatmap(image_id, what_to_save="all")
+            self.save_cloud(image_id)
+            self.save_cloud(image_id, consistent_points=True, file_name=f"consistent_cloud{image_id:06d}.ply")
