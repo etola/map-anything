@@ -182,7 +182,8 @@ class DensificationProblem:
             target_size = depth_data['target_size']
             assert depth_data['scaled_image'].shape == (target_size, target_size, 3), f"Scaled image shape {depth_data['scaled_image'].shape} does not match target size {target_size}"
             return
-        image_path = os.path.join(self.scene_folder, depth_data['image_name'])
+        image_path = os.path.join(self.scene_folder, "images", depth_data['image_name'])
+        assert os.path.exists(image_path), f"Image {image_id}: {image_path} does not exist"
         img = Image.open(image_path)
         if img.mode == "RGBA":
             background = Image.new("RGBA", img.size, (255, 255, 255, 255))
@@ -194,8 +195,13 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
         if depth_map.ndim == 4:
             depth_map = depth_map.squeeze(0).squeeze(-1)
-        if confidence_map.ndim == 4:
+        elif depth_map.ndim == 3: # 1xHxW
+            depth_map = depth_map.squeeze(0)
+        if confidence_map.ndim == 4: # 1xHxWx1
             confidence_map = confidence_map.squeeze(0).squeeze(-1)
+        elif confidence_map.ndim == 3: # 1xHxW
+            confidence_map = confidence_map.squeeze(0)
+
         depth_data['depth_map'] = depth_map
         depth_data['confidence_map'] = confidence_map
         depth_data['confidence_range'] = (np.min(confidence_map), np.max(confidence_map))
@@ -254,8 +260,8 @@ class DensificationProblem:
 
         colors = np.ones((len(valid_pts), 3), dtype=np.float32) * 0.5  # Gray color
         if scaled_image is not None:
-            simg = scaled_image.reshape(-1, 3) / 255.0
-            colors = simg[valid_mask_np]
+            simg_array = np.array(scaled_image, dtype=np.float32) / 255.0  # Shape: (518, 518, 3)
+            colors = simg_array[valid_mask_np]  # Shape: (N_valid_pixels, 3)
 
         # Subsample if max_points is specified
         if max_points is not None and len(valid_pts) > max_points:
@@ -365,24 +371,24 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
 
         if what_to_save == "depth_map" and depth_data['depth_map'] is not None:
-            rgb = colorize_heatmap(depth_data['depth_map'], depth_data['depth_range'])
+            rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range'])
             Image.fromarray(rgb).save(os.path.join(self.depth_data_folder, f"depth_{image_id:06d}.png"))
 
         elif what_to_save == "confidence_map" and depth_data['confidence_map'] is not None:
-            rgb = colorize_heatmap(depth_data['confidence_map'], depth_data['confidence_range'])
+            rgb = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range'])
             Image.fromarray(rgb).save(os.path.join(self.depth_data_folder, f"confidence_{image_id:06d}.png"))
 
         elif what_to_save == "prior_depth_map" and depth_data['prior_depth_map'] is not None:
-            rgb = colorize_heatmap(depth_data['prior_depth_map'], depth_data['depth_range'])
+            rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range'])
             Image.fromarray(rgb).save(os.path.join(self.depth_data_folder, f"prior_depth_{image_id:06d}.png"))
 
         elif what_to_save == "all":
             empty = np.zeros((depth_data['target_size'], depth_data['target_size'], 3), dtype=np.uint8)
-            depth_rgb = colorize_heatmap(depth_data['depth_map'], depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
-            conf_rgb  = colorize_heatmap(depth_data['confidence_map'], depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
-            prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
+            depth_rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
+            conf_rgb  = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
+            prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
 
-            combined = np.concatenate([prior_rgb, depth_rgb, conf_rgb], axis=1)
+            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb], axis=1)
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
     def save_point_cloud(self, image_id: int, save_path: str = None) -> None:

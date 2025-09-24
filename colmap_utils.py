@@ -413,6 +413,7 @@ class ColmapReconstruction:
 
     def get_image_ids_with_valid_points(self) -> List[int]:
         """Get list of image IDs with valid points."""
+        self._ensure_image_point_maps()
         return [image_id for image_id in self.reconstruction.images.keys() if image_id in self._image_point3D_ids]
 
     def get_visible_3d_points(self, image_id: int, min_track_length: int = 0) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:

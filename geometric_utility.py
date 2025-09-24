@@ -1,8 +1,9 @@
 
 import numpy as np
-from open3d import o3d
-from PIL import Image
+import open3d as o3d
 import matplotlib.cm as cm
+
+from PIL import Image
 
 def compute_depthmap(points_3d, intrinsics, cam_from_world, target_size):
     """
@@ -139,7 +140,7 @@ def depthmap_to_world_frame(depthmap: np.ndarray, intrinsics: np.ndarray, cam_fr
     
     return pts3d_world, valid_mask
 
-def colorize_heatmap(data_map, colormap='jet', data_range=None, save_path=None):
+def colorize_heatmap(data_map, colormap='plasma', data_range=None, save_path=None):
     """
     Colorize a data map (depth, confidence, etc.) for visualization and optionally save it.
     
@@ -161,27 +162,20 @@ def colorize_heatmap(data_map, colormap='jet', data_range=None, save_path=None):
     
     # Determine data range for normalization
     valid_mask = data_map > 0
+
+    # Create normalized data map
+    normalized_data = np.zeros_like(data_map)
+
     if np.any(valid_mask):
-        actual_min_value = np.min(data_map[valid_mask])
-        actual_max_value = np.max(data_map[valid_mask])
-        
-        # Use provided data range if available, otherwise use actual range
         if data_range is not None:
             min_value, max_value = data_range
-            # Ensure the provided range encompasses the actual data
-            min_value = min(min_value, actual_min_value)
-            max_value = max(max_value, actual_max_value)
         else:
-            min_value, max_value = actual_min_value, actual_max_value
-
-        # Create normalized data map
-        normalized_data = np.zeros_like(data_map)
+            min_value = np.min(data_map[valid_mask])
+            max_value = np.max(data_map[valid_mask])
         if max_value > min_value:
             normalized_data[valid_mask] = np.clip((data_map[valid_mask] - min_value) / (max_value - min_value), 0, 1)
         else:
             normalized_data[valid_mask] = 1.0
-    else:
-        normalized_data = np.zeros_like(data_map)
     
     # Apply colormap
     cmap = cm.get_cmap(colormap)
