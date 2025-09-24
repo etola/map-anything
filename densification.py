@@ -267,7 +267,7 @@ class DensificationProblem:
         # Filter by consistency threshold
         if consistency_threshold > 0 and consistency_map is not None:
             valid_mask = consistency_map >= consistency_threshold
-            depth_map_filtered = depth_map_filtered[valid_mask]
+            depth_map_filtered[~valid_mask] = 0
             print(f"Filtered by consistency >= {consistency_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map_filtered.shape)} pixels")
 
         if depth_map_filtered is None:
@@ -420,6 +420,8 @@ class DensificationProblem:
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
     def save_cloud(self, image_id: int, consistent_points: bool = False, file_name: str = None) -> None:
+        if self.get_depth_data(image_id)['depth_map'] is None:
+            return
         pts, colors, _ = self.get_point_cloud(image_id, consistency_threshold=self.fusion_min_consistency_count if consistent_points else 0)
         if file_name is None:
             file_name = f"pointcloud_{image_id:06d}.ply"
@@ -454,22 +456,99 @@ class DensificationProblem:
 
 
     def compute_consistency_map(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
+        """
+        Compute consistency map by projecting valid 3D points to partner camera and comparing depths.
+        
+        Args:
+            points_3d: HxWx3 array of 3D points in world coordinates
+            valid_mask: HxW boolean mask indicating valid points
+            partner_id: ID of partner image for consistency check
+            
+        Returns:
+            consistency_map: HxW array indicating consistency (1.0 = consistent, 0.0 = inconsistent)
+        """
         partner_depth_data = self.get_depth_data(partner_id)
         partner_depth_map = partner_depth_data['depth_map']
         if partner_depth_map is None:
             return np.zeros((self.target_size, self.target_size), dtype=np.float32)
 
         partner_intrinsics = partner_depth_data['camera_intrinsics']
-        partner_pose = partner_depth_data['camera_pose']
-
-        projected_depth_map = compute_depthmap(points_3d, partner_intrinsics, partner_pose, self.target_size)
-        valid_mask = valid_mask & (projected_depth_map > 0)
-
-        # compare the partner depth map with the projected depth map and compute the consistency map at valid_mask locations
-        # if the difference is less than the consistency threshold, then the point is consistent and the consistency map is 1
-        # otherwise the consistency map is 0
+        partner_pose = partner_depth_data['camera_pose']  # cam_from_world for partner
+        
+        # Initialize consistency map (default to inconsistent)
         consistency_map = np.zeros((self.target_size, self.target_size), dtype=np.float32)
-        consistency_map[valid_mask] = np.abs(partner_depth_map[valid_mask] - projected_depth_map[valid_mask]) / projected_depth_map[valid_mask] < self.fusion_consistency_threshold
+        
+        # Extract valid 3D points and their original coordinates
+        valid_points_3d = points_3d[valid_mask]  # Shape: (N, 3)
+        if len(valid_points_3d) == 0:
+            return consistency_map
+        
+        # Get original pixel coordinates of valid points
+        valid_coords = np.where(valid_mask)  # (y_coords, x_coords)
+        valid_y, valid_x = valid_coords[0], valid_coords[1]
+        
+        # Transform 3D points to partner camera coordinates
+        points_3d_homo = np.hstack([valid_points_3d, np.ones((len(valid_points_3d), 1))])
+        cam_coords = (partner_pose @ points_3d_homo.T).T[:, :3]  # (N, 3)
+        
+        # Filter points behind camera
+        valid_depth_mask = cam_coords[:, 2] > 0
+        if not np.any(valid_depth_mask):
+            return consistency_map
+        
+        # Keep only points with valid depth
+        cam_coords = cam_coords[valid_depth_mask]
+        original_y = valid_y[valid_depth_mask]
+        original_x = valid_x[valid_depth_mask]
+        
+        # Project to image coordinates
+        proj_coords = (partner_intrinsics @ cam_coords.T).T
+        proj_coords = proj_coords / proj_coords[:, 2:3]  # Normalize by depth
+        
+        # Get pixel coordinates and depths
+        partner_pixel_x = proj_coords[:, 0].astype(int)
+        partner_pixel_y = proj_coords[:, 1].astype(int)
+        projected_depths = cam_coords[:, 2]
+        
+        # Filter points within image bounds
+        in_bounds_mask = (
+            (partner_pixel_x >= 0) & (partner_pixel_x < self.target_size) &
+            (partner_pixel_y >= 0) & (partner_pixel_y < self.target_size)
+        )
+        
+        if not np.any(in_bounds_mask):
+            return consistency_map
+        
+        # Keep only in-bounds points
+        partner_pixel_x = partner_pixel_x[in_bounds_mask]
+        partner_pixel_y = partner_pixel_y[in_bounds_mask]
+        projected_depths = projected_depths[in_bounds_mask]
+        original_y = original_y[in_bounds_mask]
+        original_x = original_x[in_bounds_mask]
+        
+        # Get partner's depth values at projected locations
+        partner_depths = partner_depth_map[partner_pixel_y, partner_pixel_x]
+        
+        # Compare depths where partner has valid measurements
+        valid_partner_mask = partner_depths > 0
+        if not np.any(valid_partner_mask):
+            return consistency_map
+        
+        # Compute consistency for valid comparisons
+        valid_partner_depths = partner_depths[valid_partner_mask]
+        valid_projected_depths = projected_depths[valid_partner_mask]
+        valid_original_y = original_y[valid_partner_mask]
+        valid_original_x = original_x[valid_partner_mask]
+        
+        # Compute relative depth difference
+        depth_diff = np.abs(valid_partner_depths - valid_projected_depths) / np.maximum(valid_projected_depths, 1e-6)
+        
+        # Mark as consistent if relative difference is below threshold
+        is_consistent = depth_diff < self.fusion_consistency_threshold
+        
+        # Set consistency values in original image coordinates
+        consistency_map[valid_original_y, valid_original_x] = is_consistent.astype(np.float32)
+        
         return consistency_map
 
     def compute_consistency(self) -> None:
