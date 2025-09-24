@@ -104,6 +104,9 @@ class ParallelExecutor:
         
         print(f"    {progress_desc}: {len(image_id_list)} items using {workers} workers...")
         
+        import time
+        start_time = time.time()
+        
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_img_id = {
@@ -111,8 +114,11 @@ class ParallelExecutor:
                 for img_id in image_id_list
             }
             
+            print(f"    All {len(image_id_list)} tasks submitted, waiting for completion...")
+            
             # Process completed tasks with progress bar
-            with tqdm(total=len(image_id_list), desc=progress_desc, unit="item") as pbar:
+            with tqdm(total=len(image_id_list), desc=progress_desc, unit="item", 
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
                 for future in as_completed(future_to_img_id):
                     img_id = future_to_img_id[future]
                     try:
@@ -121,6 +127,9 @@ class ParallelExecutor:
                     except Exception as exc:
                         print(f'Processing item {img_id} generated an exception: {exc}')
                         pbar.update(1)
+        
+        elapsed = time.time() - start_time
+        print(f"    Completed {progress_desc} in {elapsed:.2f} seconds ({elapsed/len(image_id_list):.2f}s per item)")
 
 class DensificationProblem:
     """
@@ -187,7 +196,7 @@ class DensificationProblem:
         self.parallel_executor = ParallelExecutor()  # Parallel execution helper
 
         # parameters for fusion
-        self.fusion_max_partners = 8
+        self.fusion_max_partners = 4  # Reduced from 8 to 4 for faster processing
         self.fusion_min_points = 50
         self.fusion_parallax_sample_size = 50
         self.fusion_consistency_threshold = 0.05
@@ -291,11 +300,26 @@ class DensificationProblem:
         for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
 
+        # Option 1: Skip prior depth for fast startup
+        # Option 2: Compute prior depth with reduced workers to avoid overwhelming system  
+        # Option 3: Compute prior depth normally (slower but complete)
+        
+        # Uncomment ONE of the following options:
+        
+        # Option 2: Reduced workers (recommended)
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_prior_depth_data_from_reference,
             self.active_image_ids,
-            progress_desc="Initializing Prior Depth Data from Reference"
+            progress_desc="Initializing Prior Depth Data from Reference",
+            max_workers=2  # Reduce workers to avoid overwhelming system
         )
+        
+        # Option 3: Full parallel (may be slower overall due to resource contention)
+        # self.parallel_executor.run_in_parallel_no_return(
+        #     self.initialize_prior_depth_data_from_reference,
+        #     self.active_image_ids,
+        #     progress_desc="Initializing Prior Depth Data from Reference"
+        # )
 
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_scaled_image,
@@ -310,7 +334,10 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
         ref_image_id = self.source_to_target_image_id_mapping[image_id]
         assert ref_image_id is not None, f"No target image id found for image {image_id}"
+        
+        # This is the expensive operation - 3D point projection
         prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_size, min_track_length=1)
+        
         if prior_depth_map is None:
             print(f"Warning: No prior depth map found for image {image_id}")
         depth_data['prior_depth_map'] = prior_depth_map
@@ -578,18 +605,43 @@ class DensificationProblem:
         return valid_partners[:self.fusion_max_partners]
 
     def compute_consistency_image(self, image_id: int):
+        import time
+        start_time = time.time()
+        
         partner_image_ids = self.find_best_partners_for_image(image_id)
         depth_data = self.get_depth_data(image_id)
         depth_map = depth_data['depth_map']
         if depth_map is None:
             return
 
+        # Early termination if no partners found
+        if len(partner_image_ids) == 0:
+            depth_data['consistency_map'] = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
+            return
+
         consistency_map = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
+        
+        # This is expensive - convert depth map to 3D world points
+        t1 = time.time()
         points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-        for partner_id in partner_image_ids:
+        depth_to_3d_time = time.time() - t1
+        
+        # Process each partner (this is the main bottleneck)
+        consistency_time = 0
+        for i, partner_id in enumerate(partner_image_ids):
+            t2 = time.time()
             cmap_partner = self.compute_consistency_map(points_3d, valid_mask, partner_id)
+            consistency_time += time.time() - t2
             consistency_map += cmap_partner
+            
         depth_data['consistency_map'] = consistency_map
+        
+        total_time = time.time() - start_time
+        # Uncomment for detailed timing (will be verbose)
+        # print(f"Image {image_id}: {len(partner_image_ids)} partners, "
+        #       f"3D conversion: {depth_to_3d_time:.2f}s, "
+        #       f"consistency: {consistency_time:.2f}s, "
+        #       f"total: {total_time:.2f}s")
 
 
     def compute_consistency_map(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
@@ -689,11 +741,32 @@ class DensificationProblem:
         return consistency_map
 
     def compute_consistency(self) -> None:
+        # Option 1: Skip consistency computation for fastest processing
+        # Option 2: Reduced workers (recommended)
+        # Option 3: Full parallel processing
+        
+        # Uncomment ONE of the following options:
+        
+        # Option 1: Skip entirely (fastest for testing)
+        # print("Skipping consistency computation for faster processing")
+        # return
+        
+        # Option 2: Reduced workers (recommended - currently active)
+        # Reduced workers for compute_consistency since each image does heavy computation
+        # with multiple partners (geometric operations are CPU-intensive)
         self.parallel_executor.run_in_parallel_no_return(
             self.compute_consistency_image,
             self.active_image_ids,
-            progress_desc="Computing consistency"
+            progress_desc="Computing consistency",
+            max_workers=2  # Reduce workers to avoid CPU thrashing
         )
+        
+        # Option 3: Full parallel (may overwhelm CPU with geometric operations)
+        # self.parallel_executor.run_in_parallel_no_return(
+        #     self.compute_consistency_image,
+        #     self.active_image_ids,
+        #     progress_desc="Computing consistency"
+        # )
 
     def _save_single_result(self, image_id: int) -> None:
         """Save all results for a single image."""
@@ -707,5 +780,6 @@ class DensificationProblem:
         self.parallel_executor.run_in_parallel_no_return(
             self._save_single_result,
             self.active_image_ids,
-            progress_desc="Saving results"
+            progress_desc="Saving results",
+            max_workers=2
         )
