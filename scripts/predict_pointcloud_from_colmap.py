@@ -55,37 +55,37 @@ def parse_args():
         help="Scene folder containing 'images' and 'sparse' subdirectories",
     )
     parser.add_argument(
-        "--output_folder",
+        "-o", "--output_folder",
         type=str,
-        default=None,
+        default="output",
         help="Output folder for results (default: scene_folder/output/)",
     )
     parser.add_argument(
-        "--seed", 
+        "-s", "--seed", 
         type=int, 
         default=42, 
         help="Random seed for reproducibility"
     )
     parser.add_argument(
-        "--memory_efficient_inference",
+        "-m", "--memory_efficient_inference",
         action="store_true",
         default=False,
         help="Use memory efficient inference for reconstruction (trades off speed)",
     )
     parser.add_argument(
-        "--resolution",
+        "-r", "--resolution",
         type=int,
         default=518,
         help="Resolution for MapAnything model inference (default: 518)",
     )
     parser.add_argument(
-        "--conf_threshold",
+        "-c", "--conf_threshold",
         type=float,
         default=0.0,
         help="Confidence threshold for depth filtering (default: 0.0)",
     )
     parser.add_argument(
-        "--max_points",
+        "-p", "--max_points",
         type=int,
         default=1000000,
         help="Maximum number of points in output point cloud (default: 1000000)",
@@ -96,7 +96,7 @@ def parse_args():
         help="Use Apache 2.0 licensed model (facebook/map-anything-apache)",
     )
     parser.add_argument(
-        "--batch_size",
+        "-b", "--batch_size",
         type=int,
         default=8,
         help="Number of images to process in each batch to manage memory usage (default: 8)",
@@ -113,13 +113,13 @@ def parse_args():
         help="Use simple sequential batching instead of smart batching",
     )
     parser.add_argument(
-        "--reference_reconstruction",
+        "-R", "--reference_reconstruction",
         type=str,
         default=None,
         help="Path to reference COLMAP reconstruction for prior depth information (default: None)",
     )
     parser.add_argument(
-        "--verbose",
+        "-v", "--verbose",
         action="store_true",
         default=False,
         help="Enable verbose output and save colorized prior and predicted depth maps",
@@ -127,7 +127,7 @@ def parse_args():
     return parser.parse_args()
 
 
-def run_depth_completion(model, depth_problem, image_ids, memory_efficient_inference=False) -> None:
+def run_depth_completion(model, depth_problem, image_ids, memory_efficient_inference=False, verbose=False) -> None:
 
     """
     Run MapAnything model inference on images with COLMAP camera parameters.
@@ -144,6 +144,7 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         img_transform = tvf.ToTensor()
 
     # setup views for model inference
+    print(f"    Setting up views for model inference for {len(image_ids)} images")
     for image_id in image_ids:
         img_depth_data = depth_problem.get_depth_data(image_id)
 
@@ -163,10 +164,10 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         if img_depth_data['prior_depth_map'] is not None:
             z_depth_tensor = torch.tensor(img_depth_data['prior_depth_map'], dtype=torch.float32).contiguous()
             if torch.isnan(z_depth_tensor).any():
-                print(f"Warning: Found NaN values in prior depth for image {image_id}, setting to 0")
+                print(f"    Warning: Found NaN values in prior depth for image {image_id}, setting to 0")
                 z_depth_tensor = torch.nan_to_num(z_depth_tensor, nan=0.0)
             if torch.isinf(z_depth_tensor).any():
-                print(f"Warning: Found infinite values in prior depth for image {image_id}, setting to 0")
+                print(f"    Warning: Found infinite values in prior depth for image {image_id}, setting to 0")
                 z_depth_tensor = torch.inf_to_num(z_depth_tensor, posinf=0.0, neginf=0.0)
             z_depth_tensor = torch.clamp(z_depth_tensor, min=0.0, max=1e6)
             # The model expects z-depth in shape [1, H, W, 1] under 'depth_z' key
@@ -174,11 +175,13 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
 
         views.append(view)
 
+    print(f"    Running model inference for {len(views)} views")
     with torch.amp.autocast("cuda", dtype=torch.float32):
         predictions = model.infer(
             views, memory_efficient_inference=memory_efficient_inference
         )
 
+    print(f"    Updating depth maps for {len(predictions)} predictions")
     # update depth maps for each image
     for i, (prediction, image_id) in enumerate(zip(predictions, image_ids)):
         if prediction is None:
@@ -186,10 +189,11 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         depth_map = prediction['depth_z'].cpu().numpy()  # (H, W) or (1, H, W, 1)
         confidence_map = prediction['conf'].cpu().numpy()  # (H, W) or (1, H, W, 1)
         depth_problem.update_depth_data(image_id, depth_map, confidence_map)
-
         depth_problem.save_depth_data(image_id)
-        depth_problem.save_heatmap(image_id, what_to_save="all")
-        depth_problem.save_point_cloud(image_id)
+
+        if verbose:
+            depth_problem.save_heatmap(image_id, what_to_save="all")
+            depth_problem.save_point_cloud(image_id)
         
     del predictions
 
@@ -230,13 +234,12 @@ def main():
         print(f"Processing {len(batches)} sequential batches with batch size {args.batch_size}")
     
     for batch_idx, batch_image_ids in enumerate(batches):
-
+        print(f"Processing batch {batch_idx} with {len(batch_image_ids)} images")
         with torch.no_grad():
-            run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference)
+            run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
             # Clear GPU memory
             torch.cuda.empty_cache()
-
-        break
+        
 
 
 if __name__ == "__main__":

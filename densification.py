@@ -5,6 +5,7 @@ import numpy as np
 from colmap_utils import ColmapReconstruction, build_image_id_mapping, compute_image_depthmap
 from PIL import Image
 import matplotlib.cm as cm
+from tqdm import tqdm
 
 import open3d as o3d
 
@@ -128,7 +129,8 @@ class DensificationProblem:
         import glob
         self.active_image_ids = []
         depth_data_files = glob.glob(os.path.join(self.depth_data_folder, "*.npz"))
-        for df in depth_data_files:
+        print(f"Loading {len(depth_data_files)} depth data files...")
+        for df in tqdm(depth_data_files, desc="Loading depth data", unit="file"):
             data = np.load(df)
             image_id = int(data['image_id'])
             self.scene_depth_data[image_id] = data
@@ -139,27 +141,32 @@ class DensificationProblem:
 
     def initialize_with_reference(self, reference_reconstruction) -> None:
 
+        print("Initializing depth data for all active images using reference reconstruction...")
         if isinstance(reference_reconstruction, ColmapReconstruction):
             self.reference_reconstruction = reference_reconstruction
         elif isinstance(reference_reconstruction, str):
             self.reference_reconstruction = ColmapReconstruction(reference_reconstruction)
         else:
             raise ValueError("Reference reconstruction must be a ColmapReconstruction object or a string path to a COLMAP reconstruction")
-    
-        self.source_to_target_image_id_mapping =  build_image_id_mapping(self.reconstruction, self.reference_reconstruction)
-        valid_target_image_ids = self.reference_reconstruction.get_image_ids_with_valid_points()
 
+        print("    Building image id mapping...")
+        self.source_to_target_image_id_mapping =  build_image_id_mapping(self.reconstruction, self.reference_reconstruction)
+
+        valid_target_image_ids = self.reference_reconstruction.get_image_ids_with_valid_points()
+        print(f"    Nbr of images with 3d points in reference reconstruction: {len(valid_target_image_ids)}/{self.reference_reconstruction.get_num_images()}")
+
+        print("    Filtering images with no 3d points in reference reconstruction...")
         # active image ids are the image ids that have a valid mapping from the source reconstruction to the reference reconstruction
         self.active_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if self.source_to_target_image_id_mapping[img_id] is not None and  self.source_to_target_image_id_mapping[img_id] in valid_target_image_ids]
-        print(f"Found {len(self.active_image_ids)}/{self.reconstruction.get_num_images()} active image ids")
+        print(f"    Found {len(self.active_image_ids)}/{self.reconstruction.get_num_images()} active image ids")
 
-        # missing image ids are the image ids that do not have a valid mapping from the source reconstruction to the reference reconstruction
-        self.missing_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if img_id not in self.active_image_ids]
-        print(f"Missing Image IDs: {self.missing_image_ids}")
-        for img_id in self.missing_image_ids:
-            print(f"  {img_id}: {self.reconstruction.get_image_name(img_id)}")
+        # # missing image ids are the image ids that do not have a valid mapping from the source reconstruction to the reference reconstruction
+        # self.missing_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if img_id not in self.active_image_ids]
+        # print(f"Missing Image IDs: {self.missing_image_ids}")
+        # for img_id in self.missing_image_ids:
+        #     print(f"  {img_id}: {self.reconstruction.get_image_name(img_id)}")
 
-        for img_id in self.active_image_ids:
+        for img_id in tqdm(self.active_image_ids, desc="Initializing images", unit="image"):
             self.initialize_depth_data(img_id)
             self.initialize_prior_depth_data_from_reference(img_id)
             self.initialize_scaled_image(img_id)
@@ -216,7 +223,8 @@ class DensificationProblem:
         np.savez_compressed(filepath, **depth_data)
 
     def save(self) -> None:
-        for img_id in self.scene_depth_data:
+        print(f"Saving {len(self.scene_depth_data)} depth data files...")
+        for img_id in tqdm(self.scene_depth_data, desc="Saving depth data", unit="file"):
             self.save_depth_data(img_id)
 
     def load_prior_depth_data(self, image_id: int) -> None:
