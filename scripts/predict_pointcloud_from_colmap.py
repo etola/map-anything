@@ -235,7 +235,6 @@ def main():
             run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
             # Clear GPU memory
             torch.cuda.empty_cache()
-        break
         
     densification_problem.compute_consistency()
     densification_problem.save_results()

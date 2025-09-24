@@ -6,12 +6,121 @@ from colmap_utils import ColmapReconstruction, build_image_id_mapping, compute_i
 from PIL import Image
 import matplotlib.cm as cm
 from tqdm import tqdm
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import open3d as o3d
 
 from typing import List
 
 from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap
+
+
+class ParallelExecutor:
+    """
+    Generic parallel executor for running functions with image IDs in parallel.
+    """
+    
+    def __init__(self, max_workers: int = None):
+        """
+        Initialize the parallel executor.
+        
+        Args:
+            max_workers: Maximum number of worker threads. If None, uses CPU count.
+        """
+        self.max_workers = max_workers
+    
+    def run_in_parallel(self, function, image_id_list: List[int], 
+                       progress_desc: str = "Processing", 
+                       max_workers: int = None, **kwargs) -> List:
+        """
+        Execute a function in parallel for each image ID.
+        
+        Args:
+            function: Function to execute. Should accept (image_id, **kwargs) as arguments.
+            image_id_list: List of image IDs to process.
+            progress_desc: Description for the progress bar.
+            max_workers: Override the default max_workers for this execution.
+            **kwargs: Additional keyword arguments to pass to the function.
+            
+        Returns:
+            List of results from the function calls (in order of completion).
+        """
+        if not image_id_list:
+            return []
+            
+        # Determine number of workers
+        workers = max_workers or self.max_workers
+        if workers is None:
+            workers = min(len(image_id_list), os.cpu_count() or 1)
+        
+        print(f"    {progress_desc}: {len(image_id_list)} items using {workers} workers...")
+        
+        results = []
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Submit all tasks
+            future_to_img_id = {
+                executor.submit(function, img_id, **kwargs): img_id 
+                for img_id in image_id_list
+            }
+            
+            # Process completed tasks with progress bar
+            with tqdm(total=len(image_id_list), desc=progress_desc, unit="item") as pbar:
+                for future in as_completed(future_to_img_id):
+                    img_id = future_to_img_id[future]
+                    try:
+                        result = future.result()
+                        results.append(result)
+                        pbar.update(1)
+                    except Exception as exc:
+                        print(f'Processing item {img_id} generated an exception: {exc}')
+                        results.append(None)  # Add None for failed items
+                        pbar.update(1)
+        
+        return results
+    
+    def run_in_parallel_no_return(self, function, image_id_list: List[int], 
+                                 progress_desc: str = "Processing", 
+                                 max_workers: int = None, **kwargs) -> None:
+        """
+        Execute a function in parallel for each image ID without collecting results.
+        More memory efficient when you don't need the return values.
+        
+        Args:
+            function: Function to execute. Should accept (image_id, **kwargs) as arguments.
+            image_id_list: List of image IDs to process.
+            progress_desc: Description for the progress bar.
+            max_workers: Override the default max_workers for this execution.
+            **kwargs: Additional keyword arguments to pass to the function.
+        """
+        if not image_id_list:
+            return
+            
+        # Determine number of workers
+        workers = max_workers or self.max_workers
+        if workers is None:
+            workers = min(len(image_id_list), os.cpu_count() or 1)
+        
+        print(f"    {progress_desc}: {len(image_id_list)} items using {workers} workers...")
+        
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            # Submit all tasks
+            future_to_img_id = {
+                executor.submit(function, img_id, **kwargs): img_id 
+                for img_id in image_id_list
+            }
+            
+            # Process completed tasks with progress bar
+            with tqdm(total=len(image_id_list), desc=progress_desc, unit="item") as pbar:
+                for future in as_completed(future_to_img_id):
+                    img_id = future_to_img_id[future]
+                    try:
+                        future.result()  # Don't store the result
+                        pbar.update(1)
+                    except Exception as exc:
+                        print(f'Processing item {img_id} generated an exception: {exc}')
+                        pbar.update(1)
 
 class DensificationProblem:
     """
@@ -74,6 +183,8 @@ class DensificationProblem:
         self.scene_depth_data = {}        # stores all the depth data for each image
         self.active_image_ids = self.reconstruction.get_all_image_ids()
         self.source_to_target_image_id_mapping = {}
+        self._lock = threading.Lock()  # Thread lock for safe dictionary access
+        self.parallel_executor = ParallelExecutor()  # Parallel execution helper
 
         # parameters for fusion
         self.fusion_max_partners = 8
@@ -126,7 +237,8 @@ class DensificationProblem:
             'original_intrinsics': K,       # Also save original intrinsics for reference,
             'target_size': self.target_size
         }
-        self.scene_depth_data[image_id] = depth_data
+        with self._lock:
+            self.scene_depth_data[image_id] = depth_data
 
     def get_depth_data(self, image_id: int) -> dict:
         assert image_id in self.scene_depth_data, f"Image {image_id} not found in scene depth data"
@@ -176,10 +288,21 @@ class DensificationProblem:
         # for img_id in self.missing_image_ids:
         #     print(f"  {img_id}: {self.reconstruction.get_image_name(img_id)}")
 
-        for img_id in tqdm(self.active_image_ids, desc="Initializing images", unit="image"):
+        for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
-            self.initialize_prior_depth_data_from_reference(img_id)
-            self.initialize_scaled_image(img_id)
+
+        self.parallel_executor.run_in_parallel_no_return(
+            self.initialize_prior_depth_data_from_reference,
+            self.active_image_ids,
+            progress_desc="Initializing Prior Depth Data from Reference"
+        )
+
+        self.parallel_executor.run_in_parallel_no_return(
+            self.initialize_scaled_image,
+            self.active_image_ids,
+            progress_desc="Loading and Scaling Images"
+        )
+
 
     def initialize_prior_depth_data_from_reference(self, image_id: int) -> None:
         if self.reference_reconstruction is None:
@@ -232,19 +355,32 @@ class DensificationProblem:
         filepath = os.path.join(self.depth_data_folder, f"depth_{image_id:06d}.npz")
         np.savez_compressed(filepath, **depth_data)
 
-    def save(self) -> None:
-        print(f"Saving {len(self.scene_depth_data)} depth data files...")
-        for img_id in tqdm(self.scene_depth_data, desc="Saving depth data", unit="file"):
-            self.save_depth_data(img_id)
+    def save(self, max_workers: int = None) -> None:
+        """
+        Save all depth data files in parallel.
+        Args:
+            max_workers: Maximum number of worker threads for parallel saving.
+        """
+        img_ids = list(self.scene_depth_data.keys())
+        
+        self.parallel_executor.run_in_parallel_no_return(
+            self.save_depth_data,
+            img_ids,
+            progress_desc="Saving depth data",
+            max_workers=max_workers
+        )
 
     def load_prior_depth_data(self, image_id: int) -> None:
         filepath = os.path.join(self.depth_data_folder, f"depth_{image_id:06d}.npz")
         self.scene_depth_data[image_id] = np.load(filepath)
 
-    def get_point_cloud(self, image_id: int, conf_threshold: float=0.0, consistency_threshold: int=0, get_color: bool = True) -> tuple:
+    def get_point_cloud(self, image_id: int, use_prior_depth: bool=False, conf_threshold: float=0.0, consistency_threshold: int=0, get_color: bool=True) -> tuple:
         depth_data = self.get_depth_data(image_id)
 
-        depth_map = depth_data['depth_map']  # (H, W)
+        if use_prior_depth:
+            depth_map = depth_data['prior_depth_map']
+        else:
+            depth_map = depth_data['depth_map']
 
         if depth_map is None:
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
@@ -260,7 +396,7 @@ class DensificationProblem:
             valid_mask = confidence_map >= conf_threshold
             depth_map_filtered = depth_map.copy()
             depth_map_filtered[~valid_mask] = 0
-            print(f"Filtered by confidence >= {conf_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map.shape)} pixels")
+            # print(f"Filtered by confidence >= {conf_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map.shape)} pixels")
         else:
             depth_map_filtered = depth_map
 
@@ -268,21 +404,21 @@ class DensificationProblem:
         if consistency_threshold > 0 and consistency_map is not None:
             valid_mask = consistency_map >= consistency_threshold
             depth_map_filtered[~valid_mask] = 0
-            print(f"Filtered by consistency >= {consistency_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map_filtered.shape)} pixels")
+            # print(f"Filtered by consistency >= {consistency_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map_filtered.shape)} pixels")
 
         if depth_map_filtered is None:
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
 
         # Check if we have valid depth values
         if np.max(depth_map_filtered) == 0:
-            print("Warning: No valid depth values after filtering")
+            print(f"Warning: No valid depth values after filtering: Image Id {image_id:06d}")
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
         
         # Compute 3D points from depth using the saved camera parameters
         pts3d, valid_mask = depthmap_to_world_frame(depth_map_filtered, camera_intrinsics, cam_from_world)
 
         if not valid_mask.any():
-            print("Warning: No valid points found in depth map")
+            print(f"Warning: No valid points found in depth map: Image Id {image_id:06d}")
             return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
 
         # Extract valid points
@@ -419,13 +555,15 @@ class DensificationProblem:
             combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb, consistency_rgb], axis=1)
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
-    def save_cloud(self, image_id: int, consistent_points: bool = False, file_name: str = None) -> None:
+    def save_cloud(self, image_id: int, use_prior_depth: bool=False, consistent_points: bool=False, file_name: str=None) -> None:
         if self.get_depth_data(image_id)['depth_map'] is None:
             return
-        pts, colors, _ = self.get_point_cloud(image_id, consistency_threshold=self.fusion_min_consistency_count if consistent_points else 0)
+        pts, colors, _ = self.get_point_cloud(image_id, use_prior_depth=use_prior_depth, consistency_threshold=self.fusion_min_consistency_count if consistent_points else 0)
         if file_name is None:
             file_name = f"pointcloud_{image_id:06d}.ply"
         pc_path = os.path.join(self.cloud_folder, file_name)
+        if len(pts) == 0:
+            return
         save_point_cloud(pts, colors, pc_path)
 
     def find_best_partners_for_image(self, ref_image_id: int) -> List[int]:
@@ -442,12 +580,11 @@ class DensificationProblem:
     def compute_consistency_image(self, image_id: int):
         partner_image_ids = self.find_best_partners_for_image(image_id)
         depth_data = self.get_depth_data(image_id)
-        if depth_data['depth_map'] is None:
+        depth_map = depth_data['depth_map']
+        if depth_map is None:
             return
 
-        depth_map = depth_data['depth_map']
         consistency_map = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
-
         points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
         for partner_id in partner_image_ids:
             cmap_partner = self.compute_consistency_map(points_3d, valid_mask, partner_id)
@@ -552,12 +689,23 @@ class DensificationProblem:
         return consistency_map
 
     def compute_consistency(self) -> None:
-        for image_id in tqdm(self.active_image_ids, desc="Computing consistency", unit="image"):
-            self.compute_consistency_image(image_id)
+        self.parallel_executor.run_in_parallel_no_return(
+            self.compute_consistency_image,
+            self.active_image_ids,
+            progress_desc="Computing consistency"
+        )
+
+    def _save_single_result(self, image_id: int) -> None:
+        """Save all results for a single image."""
+        self.save_depth_data(image_id)
+        self.save_heatmap(image_id, what_to_save="all")
+        self.save_cloud(image_id)
+        self.save_cloud(image_id, consistent_points=True, file_name=f"consistent_cloud{image_id:06d}.ply")
+        self.save_cloud(image_id, use_prior_depth=True, file_name=f"prior_cloud{image_id:06d}.ply")
 
     def save_results(self) -> None:
-        for image_id in tqdm(self.active_image_ids, desc="Saving results", unit="image"):
-            self.save_depth_data(image_id)
-            self.save_heatmap(image_id, what_to_save="all")
-            self.save_cloud(image_id)
-            self.save_cloud(image_id, consistent_points=True, file_name=f"consistent_cloud{image_id:06d}.ply")
+        self.parallel_executor.run_in_parallel_no_return(
+            self._save_single_result,
+            self.active_image_ids,
+            progress_desc="Saving results"
+        )
