@@ -2,11 +2,15 @@
 
 import os
 import numpy as np
-from colmap_utils import ColmapReconstruction, build_image_id_mapping
+from colmap_utils import ColmapReconstruction, build_image_id_mapping, compute_image_depthmap
 from PIL import Image
 import matplotlib.cm as cm
 
+import open3d as o3d
+
 from typing import List
+
+from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud
 
 class DensificationProblem:
     """
@@ -61,6 +65,9 @@ class DensificationProblem:
         os.makedirs(self.output_folder, exist_ok=True)
         self.depth_data_folder = os.path.join(self.output_folder, "depth_data")
         os.makedirs(self.depth_data_folder, exist_ok=True)
+
+        self.cloud_folder = os.path.join(self.output_folder, "point_clouds")
+        os.makedirs(self.cloud_folder, exist_ok=True)
 
         self.scene_depth_data = {}        # stores all the depth data for each image
         self.active_image_ids = self.reconstruction.get_all_image_ids()
@@ -163,7 +170,7 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
         ref_image_id = self.source_to_target_image_id_mapping[image_id]
         assert ref_image_id is not None, f"No target image id found for image {image_id}"
-        prior_depth_map, depth_range = compute_prior_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_size, min_track_length=1)
+        prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_size, min_track_length=1)
         if prior_depth_map is None:
             print(f"Warning: No prior depth map found for image {image_id}")
         depth_data['prior_depth_map'] = prior_depth_map
@@ -351,7 +358,7 @@ class DensificationProblem:
             batches.append(batch)
         return batches
 
-    def save_heatmap(self, image_id: int, what_to_save: str = "depth_map") -> None:
+    def save_heatmap(self, image_id: int, what_to_save: str = "all") -> None:
         if what_to_save not in ["depth_map", "confidence_map", "prior_depth_map", "all"]:
             raise ValueError(f"Invalid what_to_save: {what_to_save}")
 
@@ -378,251 +385,7 @@ class DensificationProblem:
             combined = np.concatenate([prior_rgb, depth_rgb, conf_rgb], axis=1)
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
-
-
-def compute_prior_depthmap(reconstruction, image_id, scaled_intrinsics, cam_from_world, target_size, min_track_length=1, verbose=False):
-    """
-    Compute prior depth map from reference COLMAP reconstruction for a specific image.
-    This depth map will be provided to the MapAnything model as prior information via the 'depth_z' key.
-    
-    Args:
-        reference_reconstruction: ColmapReconstruction object containing prior 3D points
-        image_id: COLMAP image ID to compute depth map for
-        scaled_intrinsics: (3, 3) scaled camera intrinsics matrix
-        cam_from_world: (4, 4) camera pose matrix (ie when you multiply a 3D world point by this matrix, you get the 3D point in the camera frame)
-        target_size: target image size for depth map
-        min_track_length: minimum track length for 3D points to include        
-    Returns:
-        tuple: (prior_depth, depth_range) where:
-            - prior_depth: (target_size, target_size) numpy array with depth values, or None if no points
-            - depth_range: (min_depth, max_depth) tuple for consistent scaling, or None if no valid depths
-    """
-    try:
-        # Get visible 3D points from reference reconstruction
-        points_3d, _points_2d, _point_ids = reconstruction.get_visible_3d_points(image_id, min_track_length=min_track_length)
-
-        if len(points_3d) == 0:
-            if verbose:
-                print(f"Warning: No visible 3D points found in reference reconstruction for image {image_id}")
-            return None, None
-        
-        if verbose:
-            print(f"Computing prior depth from {len(points_3d)} 3D points for image {image_id}")
-        
-        # Project 3D points to a depth map in camera frame
-        depth_map = compute_depthmap(points_3d, scaled_intrinsics, cam_from_world, target_size)
-
-        # Check if depth map has valid depths
-        valid_depths = np.sum(depth_map > 0)
-        if valid_depths == 0:
-            if verbose:
-                print(f"Warning: No valid depths after projection for image {image_id}")
-            return None, None
-
-        if verbose:
-            print(f"Generated prior depth map with {valid_depths} valid pixels for image {image_id}")
-        
-        # Get depth range for consistent scaling
-        valid_mask = depth_map > 0
-        depth_range = None
-        if np.any(valid_mask):
-            min_depth = np.min(depth_map[valid_mask])
-            max_depth = np.max(depth_map[valid_mask])
-            depth_range = (min_depth, max_depth)
-        
-        return depth_map, depth_range
-        
-    except Exception as e:
-        print(f"Error computing prior depth for image {image_id}: {e}")
-        return None, None
-
-def compute_depthmap(points_3d, intrinsics, cam_from_world, target_size):
-    """
-    Project 3D points to depth map in camera coordinate system.
-    
-    Args:
-        points_3d: (N, 3) array of 3D world coordinates
-        intrinsics: (3, 3) scaled intrinsics matrix
-        cam_from_world (4, 4): camera to world transformation matrix
-        target_size: target image size for depth map
-        
-    Returns:
-        depth_map: (target_size, target_size) numpy array with depth values
-    """
-    if len(points_3d) == 0:
-        return np.zeros((target_size, target_size), dtype=np.float32)
-    
-    # Convert 3D points to homogeneous coordinates
-    points_3d_homo = np.hstack([points_3d, np.ones((len(points_3d), 1))])
-    
-    # Transform to camera coordinates
-    cam_coords = (cam_from_world[:3, :] @ points_3d_homo.T).T
-    
-    # Extract depth values (z-coordinates in camera frame)
-    depths = cam_coords[:, 2]
-    
-    # Filter points behind camera
-    valid_mask = depths > 0
-    if not np.any(valid_mask):
-        return np.zeros((target_size, target_size), dtype=np.float32)
-    
-    cam_coords = cam_coords[valid_mask]
-    depths = depths[valid_mask]
-    
-    # Project to image coordinates
-    proj_coords = (intrinsics @ cam_coords.T).T
-    proj_coords = proj_coords / proj_coords[:, 2:3]  # Normalize by z
-    
-    # Convert to pixel coordinates
-    pixel_x = proj_coords[:, 0].astype(int)
-    pixel_y = proj_coords[:, 1].astype(int)
-    
-    # Filter points within image bounds
-    valid_pixels = (
-        (pixel_x >= 0) & (pixel_x < target_size) &
-        (pixel_y >= 0) & (pixel_y < target_size)
-    )
-    
-    depth_map = np.zeros((target_size, target_size), dtype=np.float32)
-    
-    if np.any(valid_pixels):
-        pixel_x = pixel_x[valid_pixels]
-        pixel_y = pixel_y[valid_pixels]
-        pixel_depths = depths[valid_pixels]
-        
-        # Handle multiple points per pixel by taking the closest depth
-        # Replace 0s with infinity so that any actual depth will be smaller
-        depth_map_working = np.where(depth_map == 0, np.inf, depth_map)
-        # Use minimum.at to handle multiple points mapping to same pixel
-        np.minimum.at(depth_map_working, (pixel_y, pixel_x), pixel_depths)
-        # Replace any remaining infinities with 0 (shouldn't happen given our data)
-        depth_map[:] = np.where(depth_map_working == np.inf, 0, depth_map_working)
-    
-    return depth_map
-
-def depthmap_to_camera_frame(depthmap: np.ndarray, intrinsics: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert depth image to a pointcloud in camera frame using numpy.
-
-    Args:
-        depthmap: HxW numpy array
-        intrinsics: 3x3 numpy array
-
-    Returns:
-        pointmap in camera frame (HxWx3 array), and a mask specifying valid pixels.
-    """
-    height, width = depthmap.shape
-    
-    # Create pixel coordinate grids
-    x_grid, y_grid = np.meshgrid(np.arange(width), np.arange(height), indexing='xy')
-    
-    # Extract intrinsics parameters
-    fx = intrinsics[0, 0]
-    fy = intrinsics[1, 1] 
-    cx = intrinsics[0, 2]
-    cy = intrinsics[1, 2]
-    
-    # Convert to 3D points in camera frame
-    depth_z = depthmap
-    xx = (x_grid - cx) * depth_z / fx
-    yy = (y_grid - cy) * depth_z / fy
-    pts3d_cam = np.stack([xx, yy, depth_z], axis=-1)
-
-    # Create valid mask for non-zero depth pixels
-    valid_mask = depthmap > 0.0
-
-    return pts3d_cam, valid_mask
-
-def depthmap_to_world_frame(depthmap: np.ndarray, intrinsics: np.ndarray, cam_from_world: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Convert depth image to a pointcloud in world frame using numpy.
-
-    Args:
-        depthmap: HxW numpy array
-        intrinsics: 3x3 numpy array
-        cam_from_world: 4x4 numpy array
-
-    Returns:
-        pointmap in world frame (HxWx3 array), and a mask specifying valid pixels.
-    """
-    # Get 3D points in camera frame
-    pts3d_cam, valid_mask = depthmap_to_camera_frame(depthmap, intrinsics)
-    
-    # Convert points from camera frame to world frame
-    height, width = depthmap.shape
-    
-    # Convert to homogeneous coordinates
-    pts3d_cam_homo = np.concatenate([
-        pts3d_cam, 
-        np.ones((height, width, 1))
-    ], axis=-1)
-
-    cam_to_world = np.linalg.inv(cam_from_world)
-
-    # Transform to world coordinates: pts_world = cam_to_world @ pts_cam_homo
-    # Reshape for matrix multiplication: (H*W, 4) @ (4, 4) -> (H*W, 4)
-    pts3d_cam_homo_flat = pts3d_cam_homo.reshape(-1, 4)
-    pts3d_world_homo_flat = pts3d_cam_homo_flat @ cam_to_world.T
-    
-    # Reshape back and take only xyz coordinates
-    pts3d_world = pts3d_world_homo_flat[:, :3].reshape(height, width, 3)
-    
-    return pts3d_world, valid_mask
-
-def colorize_heatmap(data_map, colormap='plasma', data_range=None, save_path=None):
-    """
-    Colorize a data map (depth, confidence, etc.) for visualization and optionally save it.
-    
-    Args:
-        data_map / confidence_map: (H, W) numpy array with data values
-        colormap: matplotlib colormap name (default: 'plasma')
-        save_path: optional path to save the colorized image
-        data_range: optional tuple (min_value, max_value) for consistent scaling across multiple maps        
-    Returns:
-        colorized_image: (H, W, 3) RGB array of colorized data map
-    """
-    # Handle case where data map is all zeros
-    if np.max(data_map) == 0:
-        # Create a black image for zero values
-        colorized = np.zeros((data_map.shape[0], data_map.shape[1], 3), dtype=np.uint8)
-        if save_path:
-            Image.fromarray(colorized).save(save_path)
-        return colorized
-    
-    # Determine data range for normalization
-    valid_mask = data_map > 0
-    if np.any(valid_mask):
-        actual_min_value = np.min(data_map[valid_mask])
-        actual_max_value = np.max(data_map[valid_mask])
-        
-        # Use provided data range if available, otherwise use actual range
-        if data_range is not None:
-            min_value, max_value = data_range
-            # Ensure the provided range encompasses the actual data
-            min_value = min(min_value, actual_min_value)
-            max_value = max(max_value, actual_max_value)
-        else:
-            min_value, max_value = actual_min_value, actual_max_value
-
-        # Create normalized data map
-        normalized_data = np.zeros_like(data_map)
-        if max_value > min_value:
-            normalized_data[valid_mask] = np.clip((data_map[valid_mask] - min_value) / (max_value - min_value), 0, 1)
-        else:
-            normalized_data[valid_mask] = 1.0
-    else:
-        normalized_data = np.zeros_like(data_map)
-    
-    # Apply colormap
-    cmap = cm.get_cmap(colormap)
-    colorized = cmap(normalized_data)
-
-    # Set invalid pixels to black
-    colorized[~valid_mask] = [0, 0, 0, 1]
-    
-    # Convert to 8-bit RGB
-    colorized_rgb = (colorized[:, :, :3] * 255).astype(np.uint8)
-
-    return colorized_rgb
-
-
+    def save_point_cloud(self, image_id: int, save_path: str = None) -> None:
+        pts, colors = self.get_point_cloud(image_id)
+        pc_path = save_path if save_path is not None else os.path.join(self.cloud_folder, f"pointcloud_{image_id:06d}.ply")
+        save_point_cloud(pts, colors, pc_path)

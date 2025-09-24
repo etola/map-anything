@@ -16,6 +16,7 @@ import pycolmap
 from typing import Optional, Dict, Set, Tuple, List
 from tqdm import tqdm
 import os
+from geometric_utility import compute_depthmap
 
 class ColmapReconstruction:
     """
@@ -631,3 +632,60 @@ def build_image_id_mapping(source_reconstruction, target_reconstruction, source_
     for img_id in source_image_ids:
         source_to_target_image_id_mapping[img_id] = find_exact_image_match(source_reconstruction, target_reconstruction, img_id)
     return source_to_target_image_id_mapping
+
+def compute_image_depthmap(reconstruction, image_id, intrinsics, cam_from_world, target_size, min_track_length=1, verbose=False):
+    """
+    Compute prior depth map from reference COLMAP reconstruction for a specific image.
+    This depth map will be provided to the MapAnything model as prior information via the 'depth_z' key.
+    
+    Args:
+        reference_reconstruction: ColmapReconstruction object containing prior 3D points
+        image_id: COLMAP image ID to compute depth map for
+        intrinsics: (3, 3) intrinsics matrix for target_size x target_size image
+        cam_from_world: (4, 4) camera pose matrix (ie when you multiply a 3D world point by this matrix, you get the 3D point in the camera frame)
+        target_size: target image size for depth map
+        min_track_length: minimum track length for 3D points to include        
+    Returns:
+        tuple: (prior_depth, depth_range) where:
+            - prior_depth: (target_size, target_size) numpy array with depth values, or None if no points
+            - depth_range: (min_depth, max_depth) tuple for consistent scaling, or None if no valid depths
+    """
+    try:
+        # Get visible 3D points from reference reconstruction
+        points_3d, _points_2d, _point_ids = reconstruction.get_visible_3d_points(image_id, min_track_length=min_track_length)
+
+        if len(points_3d) == 0:
+            if verbose:
+                print(f"Warning: No visible 3D points found in reference reconstruction for image {image_id}")
+            return None, None
+        
+        if verbose:
+            print(f"Computing prior depth from {len(points_3d)} 3D points for image {image_id}")
+        
+        # Project 3D points to a depth map in camera frame
+        depth_map = compute_depthmap(points_3d, intrinsics, cam_from_world, target_size)
+
+        # Check if depth map has valid depths
+        valid_depths = np.sum(depth_map > 0)
+        if valid_depths == 0:
+            if verbose:
+                print(f"Warning: No valid depths after projection for image {image_id}")
+            return None, None
+
+        if verbose:
+            print(f"Generated prior depth map with {valid_depths} valid pixels for image {image_id}")
+        
+        # Get depth range for consistent scaling
+        valid_mask = depth_map > 0
+        depth_range = None
+        if np.any(valid_mask):
+            min_depth = np.min(depth_map[valid_mask])
+            max_depth = np.max(depth_map[valid_mask])
+            depth_range = (min_depth, max_depth)
+        
+        return depth_map, depth_range
+        
+    except Exception as e:
+        print(f"Error computing prior depth for image {image_id}: {e}")
+        return None, None
+

@@ -1,4 +1,4 @@
-usr/bin/env python3
+#!/usr/bin/env python3
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 #
 # This source code is licensed under the Apache License, Version 2.0
@@ -41,7 +41,7 @@ torch.backends.cudnn.benchmark = True
 torch.backends.cudnn.deterministic = False
 
 from densification import DensificationProblem
-import open3d as o3d
+from geometric_utility import save_point_cloud
 
 def parse_args():
     """Parse command line arguments."""
@@ -126,89 +126,6 @@ def parse_args():
     )
     return parser.parse_args()
 
-def colorize_heatmap(data_map, colormap='plasma', save_path=None, data_range=None, title_prefix="Heatmap"):
-    """
-    Colorize a data map (depth, confidence, etc.) for visualization and optionally save it.
-    
-    Args:
-        data_map: (H, W) numpy array with data values
-        colormap: matplotlib colormap name (default: 'plasma')
-        save_path: optional path to save the colorized image
-        data_range: optional tuple (min_value, max_value) for consistent scaling across multiple maps
-        title_prefix: prefix for the plot title (default: "Heatmap")
-        
-    Returns:
-        colorized_image: (H, W, 3) RGB array of colorized data map
-        actual_data_range: tuple (min_value, max_value) of actual data range used
-    """
-    # Handle case where data map is all zeros
-    if np.max(data_map) == 0:
-        # Create a black image for zero values
-        colorized = np.zeros((data_map.shape[0], data_map.shape[1], 3), dtype=np.uint8)
-        if save_path:
-            Image.fromarray(colorized).save(save_path)
-        return colorized, (0.0, 0.0)
-    
-    # Determine data range for normalization
-    valid_mask = data_map > 0
-    if np.any(valid_mask):
-        actual_min_value = np.min(data_map[valid_mask])
-        actual_max_value = np.max(data_map[valid_mask])
-        
-        # Use provided data range if available, otherwise use actual range
-        if data_range is not None:
-            min_value, max_value = data_range
-            # Ensure the provided range encompasses the actual data
-            min_value = min(min_value, actual_min_value)
-            max_value = max(max_value, actual_max_value)
-        else:
-            min_value, max_value = actual_min_value, actual_max_value
-        
-        # Create normalized data map
-        normalized_data = np.zeros_like(data_map)
-        if max_value > min_value:
-            normalized_data[valid_mask] = np.clip((data_map[valid_mask] - min_value) / (max_value - min_value), 0, 1)
-        else:
-            normalized_data[valid_mask] = 1.0
-            
-        actual_range = (min_value, max_value)
-    else:
-        normalized_data = np.zeros_like(data_map)
-        actual_range = (0.0, 0.0)
-    
-    # Apply colormap
-    cmap = cm.get_cmap(colormap)
-    colorized = cmap(normalized_data)
-    
-    # Set invalid pixels to black
-    colorized[~valid_mask] = [0, 0, 0, 1]
-    
-    # Convert to 8-bit RGB
-    colorized_rgb = (colorized[:, :, :3] * 255).astype(np.uint8)
-    
-    # Save if path provided
-    if save_path:
-        # Create figure with depth information
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
-        
-        # Original data map
-        im1 = ax1.imshow(data_map, cmap='gray', vmin=actual_range[0], vmax=actual_range[1])
-        ax1.set_title(f'{title_prefix} (Raw)\nMin: {actual_range[0]:.2f}, Max: {actual_range[1]:.2f}' if np.any(valid_mask) else f'{title_prefix} (Raw)\nNo valid values')
-        ax1.axis('off')
-        plt.colorbar(im1, ax=ax1, fraction=0.046, pad=0.04)
-        
-        # Colorized data map
-        ax2.imshow(colorized_rgb)
-        ax2.set_title(f'{title_prefix} (Colorized)\n{np.sum(valid_mask)} valid pixels')
-        ax2.axis('off')
-        
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        print(f"Saved colorized heatmap to: {save_path}")
-    
-    return colorized_rgb, actual_range
 
 def run_depth_completion(model, depth_problem, image_ids, memory_efficient_inference=False) -> None:
 
@@ -269,13 +186,11 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         depth_map = prediction['depth_z'].cpu().numpy()  # (H, W) or (1, H, W, 1)
         confidence_map = prediction['conf'].cpu().numpy()  # (H, W) or (1, H, W, 1)
         depth_problem.update_depth_data(image_id, depth_map, confidence_map)
+
         depth_problem.save_depth_data(image_id)
-
         depth_problem.save_heatmap(image_id, what_to_save="all")
-
-        pts, colors = depth_problem.get_point_cloud(image_id)
-        o3d.io.write_point_cloud(os.path.join(depth_problem.output_folder, f"pointcloud_{image_id:06d}.ply"), pts, colors)
-
+        depth_problem.save_point_cloud(image_id)
+        
     del predictions
 
 def main():
@@ -322,7 +237,6 @@ def main():
             torch.cuda.empty_cache()
 
         break
-
 
 
 if __name__ == "__main__":
