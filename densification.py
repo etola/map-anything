@@ -1,5 +1,3 @@
-
-
 import os
 import numpy as np
 from colmap_utils import ColmapReconstruction, build_image_id_mapping, compute_image_depthmap
@@ -256,22 +254,32 @@ class DensificationProblem:
     def get_active_image_ids(self) -> list:
         return self.active_image_ids
 
+    def _load_depth_data_file(self, depth_data_file: str) -> dict:
+        data = np.load(depth_data_file, allow_pickle=True, )
+        image_id = int(data['image_id'])
+        self.initialize_depth_data(image_id)
+        depth_data = self.get_depth_data(image_id)
+        for key in list(data.keys()):
+            if data[key].ndim == 0:
+                depth_data[key] = data[key].item()
+            else:
+                depth_data[key] = data[key]
+        assert self.target_size == depth_data['target_size']
+        assert self.reconstruction.has_image(image_id)
+        return depth_data
+
     def initialize_from_folder(self):
         import glob
         self.active_image_ids = []
         depth_data_files = glob.glob(os.path.join(self.depth_data_folder, "*.npz"))
         print(f"Loading {len(depth_data_files)} depth data files...")
         for df in tqdm(depth_data_files, desc="Loading depth data", unit="file"):
-            data = np.load(df)
-            image_id = int(data['image_id'])
-            self.scene_depth_data[image_id] = data
+            depth_data = self._load_depth_data_file(df)
+            image_id = depth_data['image_id']
             self.active_image_ids.append(image_id)
-            assert self.target_size == data['target_size']
-            assert self.reconstruction.has_image(image_id)
         self.active_image_ids.sort()
 
     def initialize_with_reference(self, reference_reconstruction) -> None:
-
         print("Initializing depth data for all active images using reference reconstruction...")
         if isinstance(reference_reconstruction, ColmapReconstruction):
             self.reference_reconstruction = reference_reconstruction
@@ -300,12 +308,6 @@ class DensificationProblem:
         for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
 
-        # Option 1: Skip prior depth for fast startup
-        # Option 2: Compute prior depth with reduced workers to avoid overwhelming system  
-        # Option 3: Compute prior depth normally (slower but complete)
-        
-        # Uncomment ONE of the following options:
-        
         # Option 2: Reduced workers (recommended)
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_prior_depth_data_from_reference,
@@ -314,13 +316,6 @@ class DensificationProblem:
             max_workers=2  # Reduce workers to avoid overwhelming system
         )
         
-        # Option 3: Full parallel (may be slower overall due to resource contention)
-        # self.parallel_executor.run_in_parallel_no_return(
-        #     self.initialize_prior_depth_data_from_reference,
-        #     self.active_image_ids,
-        #     progress_desc="Initializing Prior Depth Data from Reference"
-        # )
-
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_scaled_image,
             self.active_image_ids,
@@ -593,22 +588,21 @@ class DensificationProblem:
             return
         save_point_cloud(pts, colors, pc_path)
 
-    def find_best_partners_for_image(self, ref_image_id: int) -> List[int]:
-        partner_image_ids = self.reconstruction.find_best_partners_for_image(
+    def find_similar_images_for_image(self, ref_image_id: int) -> List[int]:
+        similar_image_ids = self.reconstruction.find_similar_images_for_image(
             image_id=ref_image_id,
-            min_points=self.fusion_min_points,
-            parallax_sample_size=self.fusion_parallax_sample_size
+            min_points=self.fusion_min_points
         )
-        if len(partner_image_ids) == 0:
+        if len(similar_image_ids) == 0:
             return []
-        valid_partners = [pid for pid in partner_image_ids if pid in self.active_image_ids]
-        return valid_partners[:self.fusion_max_partners]
+        valid_partners = [pid for pid in similar_image_ids if pid in self.active_image_ids]
+        return valid_partners
 
     def compute_consistency_image(self, image_id: int):
-        import time
-        start_time = time.time()
-        
-        partner_image_ids = self.find_best_partners_for_image(image_id)
+        partner_image_ids = self.find_similar_images_for_image(image_id)
+        partner_image_ids = partner_image_ids[:self.fusion_max_partners]
+        print(f"Computing consistency for image {image_id}: Partner images: {partner_image_ids}")
+
         depth_data = self.get_depth_data(image_id)
         depth_map = depth_data['depth_map']
         if depth_map is None:
@@ -621,27 +615,13 @@ class DensificationProblem:
 
         consistency_map = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
         
-        # This is expensive - convert depth map to 3D world points
-        t1 = time.time()
         points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-        depth_to_3d_time = time.time() - t1
-        
-        # Process each partner (this is the main bottleneck)
-        consistency_time = 0
         for i, partner_id in enumerate(partner_image_ids):
-            t2 = time.time()
             cmap_partner = self.compute_consistency_map(points_3d, valid_mask, partner_id)
-            consistency_time += time.time() - t2
             consistency_map += cmap_partner
             
         depth_data['consistency_map'] = consistency_map
         
-        total_time = time.time() - start_time
-        # Uncomment for detailed timing (will be verbose)
-        # print(f"Image {image_id}: {len(partner_image_ids)} partners, "
-        #       f"3D conversion: {depth_to_3d_time:.2f}s, "
-        #       f"consistency: {consistency_time:.2f}s, "
-        #       f"total: {total_time:.2f}s")
 
 
     def compute_consistency_map(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
@@ -741,40 +721,21 @@ class DensificationProblem:
         return consistency_map
 
     def compute_consistency(self) -> None:
-        # Option 1: Skip consistency computation for fastest processing
-        # Option 2: Reduced workers (recommended)
-        # Option 3: Full parallel processing
-        
-        # Uncomment ONE of the following options:
-        
-        # Option 1: Skip entirely (fastest for testing)
-        # print("Skipping consistency computation for faster processing")
-        # return
-        
-        # Option 2: Reduced workers (recommended - currently active)
-        # Reduced workers for compute_consistency since each image does heavy computation
-        # with multiple partners (geometric operations are CPU-intensive)
         self.parallel_executor.run_in_parallel_no_return(
             self.compute_consistency_image,
             self.active_image_ids,
             progress_desc="Computing consistency",
             max_workers=2  # Reduce workers to avoid CPU thrashing
         )
-        
-        # Option 3: Full parallel (may overwhelm CPU with geometric operations)
-        # self.parallel_executor.run_in_parallel_no_return(
-        #     self.compute_consistency_image,
-        #     self.active_image_ids,
-        #     progress_desc="Computing consistency"
-        # )
 
-    def _save_single_result(self, image_id: int) -> None:
+
+    def _save_single_result(self, image_id: int, tag: str = "") -> None:
         """Save all results for a single image."""
         self.save_depth_data(image_id)
         self.save_heatmap(image_id, what_to_save="all")
-        self.save_cloud(image_id)
-        self.save_cloud(image_id, consistent_points=True, file_name=f"consistent_cloud{image_id:06d}.ply")
-        self.save_cloud(image_id, use_prior_depth=True, file_name=f"prior_cloud{image_id:06d}.ply")
+        self.save_cloud(image_id, file_name=f"{tag}cloud{image_id:06d}.ply")
+        self.save_cloud(image_id, consistent_points=True, file_name=f"{tag}consistent_cloud{image_id:06d}.ply")
+        self.save_cloud(image_id, use_prior_depth=True, file_name=f"{tag}prior_cloud{image_id:06d}.ply")
 
     def save_results(self) -> None:
         self.parallel_executor.run_in_parallel_no_return(

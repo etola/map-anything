@@ -205,6 +205,11 @@ def main():
 
     densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.output_folder)
 
+    # densification_problem.initialize_from_folder()
+    # densification_problem.compute_consistency_image(122)
+    # densification_problem._save_single_result(122, tag="new_")
+
+
     if args.reference_reconstruction is not None:
         densification_problem.initialize_with_reference(args.reference_reconstruction)
 
@@ -230,7 +235,7 @@ def main():
         print(f"Processing {len(batches)} sequential batches with batch size {args.batch_size}")
     
     for batch_idx, batch_image_ids in enumerate(batches):
-        print(f"Processing batch {batch_idx} with {len(batch_image_ids)} images")
+        print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
         with torch.no_grad():
             run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
             # Clear GPU memory

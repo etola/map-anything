@@ -101,11 +101,7 @@ class ColmapReconstruction:
             return 0.0, 0.0
         
         # Check if we have valid shared points for this image
-        valid_shared_points = []
-        for point_id in shared_points:
-            if point_id in self._image_point3D_xy[image_id]:
-                valid_shared_points.append(point_id)
-        
+        valid_shared_points = [point_id for point_id in shared_points if point_id in self._image_point3D_xy[image_id]]
         if len(valid_shared_points) < 2:
             return 0.0, 0.0
         
@@ -151,6 +147,39 @@ class ColmapReconstruction:
             
         return np.mean(parallax_angles)
     
+    def find_similar_images_for_image(self, image_id: int, min_points: int = 10) -> List[int]:
+        """
+        Finds similar images for a given image based on shared 3D points.
+        """
+        if not self.has_image(image_id):
+            return []
+
+        self._ensure_image_point_maps()
+
+        if image_id not in self._image_point3D_ids:
+            return []
+
+        similar_images = []
+        for other_image in self.reconstruction.images.values():
+            if other_image.image_id == image_id:
+                continue
+            shared_points = self.find_shared_point_list(image_id, other_image.image_id)
+            if len(shared_points) >= min_points:
+                similar_images.append(MatchCandidate(other_image.image_id, shared_points))
+        if len(similar_images) == 0:
+            return []
+
+        similar_images.sort(key=lambda x: len(x.shared_points), reverse=True)
+        return [s.image_id for s in similar_images]
+
+    def find_shared_point_list(self, image_id0: int, image_id1: int) -> List[int]:
+        """
+        Finds the shared 3D points between two images.
+        """
+        if not self.has_image(image_id0) or not self.has_image(image_id1):
+            return []
+        self._ensure_image_point_maps()
+        return self._image_point3D_ids[image_id0] & self._image_point3D_ids[image_id1]
    
     def find_best_partners_for_image(self, image_id: int, min_points: int = 100, 
                                    parallax_sample_size: int = 100) -> List[int]:
@@ -170,38 +199,32 @@ class ColmapReconstruction:
         
         # Check if the current image has any 3D points
         if self._image_point3D_ids is None or image_id not in self._image_point3D_ids:
-            return [-1]
+            return []
         
         # Find other images that share at least min_points points
         other_images = [other_image for other_image in self.reconstruction.images.values() 
                        if other_image.image_id != image_id]
         match_candidates = []
-        
         for other_image in other_images:
             if other_image.image_id not in self._image_point3D_ids:
                 continue
             # Get the points that the two images share
-            shared_points = self._image_point3D_ids[image_id] & self._image_point3D_ids[other_image.image_id]
-            if len(shared_points) > 0:  # Only add if there are shared points
+            shared_points = self.find_shared_point_list(image_id, other_image.image_id)
+            if len(shared_points) >= min_points:  # Only add if there are shared points
                 match_candidates.append(MatchCandidate(other_image.image_id, shared_points))
         
         # Sort by number of shared points
         match_candidates.sort(key=lambda x: len(x.shared_points), reverse=True)
         
         # Skip if no good candidates found
-        if len(match_candidates) == 0 or len(match_candidates[0].shared_points) < min_points:
-            return [-1]
+        if len(match_candidates) == 0:
+            return []
         
-        # Filter out match candidates that don't have enough matches
-        match_candidates = [candidate for candidate in match_candidates 
-                          if len(candidate.shared_points) >= min_points]
-
         # Compute feature coverage for each candidate
         for match_candidate in match_candidates:
             x_cov, y_cov = self.compute_feature_coverage(match_candidate.shared_points, image_id)
             match_candidate.x_coverage = x_cov
             match_candidate.y_coverage = y_cov
-
         # Order match candidates by average xy coverage
         match_candidates.sort(key=lambda x: (x.x_coverage + x.y_coverage) / 2, reverse=True)
 
@@ -211,9 +234,6 @@ class ColmapReconstruction:
                 match_candidate.shared_points, image_id, match_candidate.image_id, 
                 parallax_sample_size)
 
-        if len(match_candidates) == 0:
-            return [-1]
-        
         # Collect all candidates with good parallax
         good_parallax_candidates = []
         for candidate in match_candidates:
@@ -560,7 +580,7 @@ def load_reconstruction(reconstruction_path):
         raise ValueError(f"Failed to load COLMAP reconstruction from {reconstruction_path}: {e}")
 
 
-def find_exact_image_match(source_reconstruction, target_reconstruction, source_image_id):
+def find_exact_image_match(source_reconstruction: ColmapReconstruction, target_reconstruction: ColmapReconstruction, source_image_id: int):
     """
     Find the exact match of a single image from source reconstruction in target reconstruction.
     """
