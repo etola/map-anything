@@ -139,6 +139,7 @@ class DensificationProblem:
         'scaled_image'          : image_scaled in target_size x target_size,
         'depth_map'             : depth_map in target_size x target_size or None,
         'confidence_map'        : confidence_map in target_size x target_size or None,
+        'fused_depth_map'       : fused depth map in target_size x target_size or None,
         'prior_depth_map'       : prior depth map in target_size x target_size or None,
         'consistency_map'       : consistency map of the estimated depth map with the partner images map in target_size x target_size or None,
         'depth_range'           : (min_depth, max_depth) tuple for consistent scaling, or None if no valid depths,
@@ -242,10 +243,12 @@ class DensificationProblem:
             'camera_intrinsics': K_scaled,  # Use scaled intrinsics
             'camera_pose': pose_4x4,        # Use 4x4 cam_from_world pose matrix
             'original_intrinsics': K,       # Also save original intrinsics for reference,
-            'target_size': self.target_size
+            'target_size': self.target_size,
+            'partner_image_ids': self.find_similar_images_for_image(image_id, self.fusion_max_partners)
         }
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
+
 
     def get_depth_data(self, image_id: int) -> dict:
         assert image_id in self.scene_depth_data, f"Image {image_id} not found in scene depth data"
@@ -491,14 +494,17 @@ class DensificationProblem:
             if reference_image_id is None:
                 break
 
-            best_partners = self.reconstruction.find_best_partners_for_image(
+            best_partners = self.reconstruction.find_similar_images_for_image(
                 reference_image_id, 
-                min_points=50,  # Lower threshold for more flexibility
-                parallax_sample_size=50
+                min_points=10,  # Lower threshold for more flexibility
             )
             
-            valid_partners = [pid for pid in best_partners if pid != -1 and pid in self.active_image_ids]
-            
+            valid_partners = [pid for pid in best_partners if pid in self.active_image_ids]
+            if len(valid_partners) == 0:
+                print(f"No valid partners found for image {reference_image_id}")
+                used_as_reference.add(reference_image_id)
+                continue
+
             # Start batch with reference image
             batch = [reference_image_id]
             
@@ -572,9 +578,17 @@ class DensificationProblem:
             depth_rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
             conf_rgb  = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
             prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
-            consistency_rgb = colorize_heatmap(depth_data['consistency_map'], data_range=(0, self.fusion_min_consistency_count)) if depth_data['consistency_map'] is not None else empty
+            consistency_rgb = colorize_heatmap(depth_data['consistency_map'], data_range=(0, self.fusion_max_partners-1)) if depth_data['consistency_map'] is not None else empty
 
-            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb, consistency_rgb], axis=1)
+            # generate a target_size x 50 image.
+            # fill the image from bottom to top with 0:self.fusion_max_partners-1 (split target_size/self.fusion_max_partners rows)
+            # then call colorize_heatmap on this legend_image to get legend_rgb and concat it with the other images
+            legend_image = np.zeros((self.target_size, 50), dtype=np.float32)
+            for i in range(self.fusion_max_partners):
+                legend_image[i*self.target_size//self.fusion_max_partners:(i+1)*self.target_size//self.fusion_max_partners, :] = i
+            legend_rgb = colorize_heatmap(legend_image, data_range=(0, self.fusion_max_partners-1))
+
+            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb, consistency_rgb, legend_rgb], axis=1)
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
     def save_cloud(self, image_id: int, use_prior_depth: bool=False, consistent_points: bool=False, file_name: str=None) -> None:
@@ -588,7 +602,7 @@ class DensificationProblem:
             return
         save_point_cloud(pts, colors, pc_path)
 
-    def find_similar_images_for_image(self, ref_image_id: int) -> List[int]:
+    def find_similar_images_for_image(self, ref_image_id: int, max_partners: int) -> List[int]:
         similar_image_ids = self.reconstruction.find_similar_images_for_image(
             image_id=ref_image_id,
             min_points=self.fusion_min_points
@@ -596,17 +610,16 @@ class DensificationProblem:
         if len(similar_image_ids) == 0:
             return []
         valid_partners = [pid for pid in similar_image_ids if pid in self.active_image_ids]
-        return valid_partners
+        return valid_partners[:max_partners]
 
     def compute_consistency_image(self, image_id: int):
-        partner_image_ids = self.find_similar_images_for_image(image_id)
-        partner_image_ids = partner_image_ids[:self.fusion_max_partners]
-        print(f"Computing consistency for image {image_id}: Partner images: {partner_image_ids}")
-
         depth_data = self.get_depth_data(image_id)
         depth_map = depth_data['depth_map']
         if depth_map is None:
             return
+
+        partner_image_ids = depth_data['partner_image_ids']
+        # print(f"Computing consistency for image {image_id}: Partner images: {partner_image_ids}")
 
         # Early termination if no partners found
         if len(partner_image_ids) == 0:
@@ -616,15 +629,31 @@ class DensificationProblem:
         consistency_map = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
         
         points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
+
+        # partner_valid_maps = {}
+
         for i, partner_id in enumerate(partner_image_ids):
-            cmap_partner = self.compute_consistency_map(points_3d, valid_mask, partner_id)
-            consistency_map += cmap_partner
-            
+            valid_partner_depths = self.compute_consistency_map_depths(points_3d, valid_mask, partner_id)
+            # partner_valid_maps[partner_id] = valid_partner_depths
+            consistency_map += (valid_partner_depths[:, :, 2] > 0).astype(np.float32)
+
+        # self.fusion.fuse_depth_maps(image_id, partner_valid_maps)
+
         depth_data['consistency_map'] = consistency_map
+        
+    def fuse_depth_maps(self, image_id: int, partner_valid_maps: dict) -> None:
+
+        depth_data = self.get_depth_data(image_id)
+        depth_map = depth_data['depth_map']
+        if depth_map is None:
+            return
+
+
         
 
 
-    def compute_consistency_map(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
+
+    def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
         """
         Compute consistency map by projecting valid 3D points to partner camera and comparing depths.
         
@@ -634,18 +663,18 @@ class DensificationProblem:
             partner_id: ID of partner image for consistency check
             
         Returns:
-            consistency_map: HxW array indicating consistency (1.0 = consistent, 0.0 = inconsistent)
+            consistency_map: HxWx3 array containing [u, v, depth] where u,v are partner image coordinates (all 0.0 = invalid)
         """
         partner_depth_data = self.get_depth_data(partner_id)
         partner_depth_map = partner_depth_data['depth_map']
         if partner_depth_map is None:
-            return np.zeros((self.target_size, self.target_size), dtype=np.float32)
+            return np.zeros((self.target_size, self.target_size, 3), dtype=np.float32)
 
         partner_intrinsics = partner_depth_data['camera_intrinsics']
         partner_pose = partner_depth_data['camera_pose']  # cam_from_world for partner
         
-        # Initialize consistency map (default to inconsistent)
-        consistency_map = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+        # Initialize consistency map (default to invalid [u, v, depth])
+        consistency_map = np.zeros((self.target_size, self.target_size, 3), dtype=np.float32)
         
         # Extract valid 3D points and their original coordinates
         valid_points_3d = points_3d[valid_mask]  # Shape: (N, 3)
@@ -708,15 +737,23 @@ class DensificationProblem:
         valid_projected_depths = projected_depths[valid_partner_mask]
         valid_original_y = original_y[valid_partner_mask]
         valid_original_x = original_x[valid_partner_mask]
+        valid_partner_pixel_x = partner_pixel_x[valid_partner_mask]
+        valid_partner_pixel_y = partner_pixel_y[valid_partner_mask]
         
         # Compute relative depth difference
         depth_diff = np.abs(valid_partner_depths - valid_projected_depths) / np.maximum(valid_projected_depths, 1e-6)
         
-        # Mark as consistent if relative difference is below threshold
+        # Check consistency threshold
         is_consistent = depth_diff < self.fusion_consistency_threshold
         
-        # Set consistency values in original image coordinates
-        consistency_map[valid_original_y, valid_original_x] = is_consistent.astype(np.float32)
+        # Set [u, v, depth] for consistent points, [0, 0, 0] for inconsistent
+        consistent_u = np.where(is_consistent, valid_partner_pixel_x, 0.0)
+        consistent_v = np.where(is_consistent, valid_partner_pixel_y, 0.0)
+        consistent_depths = np.where(is_consistent, valid_partner_depths, 0.0)
+        
+        consistency_map[valid_original_y, valid_original_x, 0] = consistent_u
+        consistency_map[valid_original_y, valid_original_x, 1] = consistent_v
+        consistency_map[valid_original_y, valid_original_x, 2] = consistent_depths
         
         return consistency_map
 
@@ -744,3 +781,4 @@ class DensificationProblem:
             progress_desc="Saving results",
             max_workers=2
         )
+
