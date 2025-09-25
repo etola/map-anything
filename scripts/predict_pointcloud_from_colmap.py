@@ -241,7 +241,7 @@ def main():
             # Clear GPU memory
             torch.cuda.empty_cache()
         
-    densification_problem.compute_consistency()
+    densification_problem.compute_consistency(run_fusion=True)
     densification_problem.save_results()
 
 

@@ -200,6 +200,7 @@ class DensificationProblem:
         self.fusion_parallax_sample_size = 50
         self.fusion_consistency_threshold = 0.05
         self.fusion_min_consistency_count = 2
+        self.fusion_run_flag = False
 
 
     def clear(self) -> None:
@@ -237,6 +238,7 @@ class DensificationProblem:
             'depth_map': None,
             'confidence_map': None,
             'prior_depth_map': None,
+            'fused_depth_map': None,
             'consistency_map': None,
             'depth_range': None,
             'confidence_range': None,
@@ -399,16 +401,18 @@ class DensificationProblem:
         filepath = os.path.join(self.depth_data_folder, f"depth_{image_id:06d}.npz")
         self.scene_depth_data[image_id] = np.load(filepath)
 
-    def get_point_cloud(self, image_id: int, use_prior_depth: bool=False, conf_threshold: float=0.0, consistency_threshold: int=0, get_color: bool=True) -> tuple:
+    def get_point_cloud(self, image_id: int, use_prior_depth: bool=False, use_fused_depth: bool=False, conf_threshold: float=0.0, consistency_threshold: int=0, get_color: bool=True) -> tuple:
         depth_data = self.get_depth_data(image_id)
 
         if use_prior_depth:
             depth_map = depth_data['prior_depth_map']
+        elif use_fused_depth:
+            depth_map = depth_data['fused_depth_map']
         else:
             depth_map = depth_data['depth_map']
 
         if depth_map is None:
-            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+            return None, None, None
 
         confidence_map = depth_data['confidence_map']  # (H, W)
         consistency_map = depth_data['consistency_map']  # (H, W)
@@ -432,12 +436,12 @@ class DensificationProblem:
             # print(f"Filtered by consistency >= {consistency_threshold}: {np.sum(valid_mask)}/{np.prod(depth_map_filtered.shape)} pixels")
 
         if depth_map_filtered is None:
-            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+            return None, None, None
 
         # Check if we have valid depth values
         if np.max(depth_map_filtered) == 0:
             print(f"Warning: No valid depth values after filtering: Image Id {image_id:06d}")
-            return np.array([]).reshape(0, 3), np.array([]).reshape(0, 3), {}
+            return None, None, None
         
         # Compute 3D points from depth using the saved camera parameters
         pts3d, valid_mask = depthmap_to_world_frame(depth_map_filtered, camera_intrinsics, cam_from_world)
@@ -578,28 +582,25 @@ class DensificationProblem:
             depth_rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
             conf_rgb  = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
             prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
+            fusion_rgb = colorize_heatmap(depth_data['fused_depth_map'], data_range=depth_data['depth_range']) if depth_data['fused_depth_map'] is not None else empty
             consistency_rgb = colorize_heatmap(depth_data['consistency_map'], data_range=(0, self.fusion_max_partners-1)) if depth_data['consistency_map'] is not None else empty
 
-            # generate a target_size x 50 image.
-            # fill the image from bottom to top with 0:self.fusion_max_partners-1 (split target_size/self.fusion_max_partners rows)
-            # then call colorize_heatmap on this legend_image to get legend_rgb and concat it with the other images
+            # generate a legend image
             legend_image = np.zeros((self.target_size, 50), dtype=np.float32)
             for i in range(self.fusion_max_partners):
                 legend_image[i*self.target_size//self.fusion_max_partners:(i+1)*self.target_size//self.fusion_max_partners, :] = i
             legend_rgb = colorize_heatmap(legend_image, data_range=(0, self.fusion_max_partners-1))
 
-            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, conf_rgb, consistency_rgb, legend_rgb], axis=1)
+            combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, fusion_rgb, conf_rgb, consistency_rgb, legend_rgb], axis=1)
             Image.fromarray(combined).save(os.path.join(self.depth_data_folder, f"data_{image_id:06d}.png"))
 
-    def save_cloud(self, image_id: int, use_prior_depth: bool=False, consistent_points: bool=False, file_name: str=None) -> None:
-        if self.get_depth_data(image_id)['depth_map'] is None:
+    def save_cloud(self, image_id: int, use_prior_depth: bool=False, use_fused_depth: bool=False, consistent_points: bool=False, file_name: str=None) -> None:
+        pts, colors, _ = self.get_point_cloud(image_id, use_prior_depth=use_prior_depth, use_fused_depth=use_fused_depth, consistency_threshold=self.fusion_min_consistency_count if consistent_points else 0)
+        if pts is None:
             return
-        pts, colors, _ = self.get_point_cloud(image_id, use_prior_depth=use_prior_depth, consistency_threshold=self.fusion_min_consistency_count if consistent_points else 0)
         if file_name is None:
             file_name = f"pointcloud_{image_id:06d}.ply"
         pc_path = os.path.join(self.cloud_folder, file_name)
-        if len(pts) == 0:
-            return
         save_point_cloud(pts, colors, pc_path)
 
     def find_similar_images_for_image(self, ref_image_id: int, max_partners: int) -> List[int]:
@@ -630,27 +631,114 @@ class DensificationProblem:
         
         points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
 
-        # partner_valid_maps = {}
-
+        valid_partner_maps = {}
         for i, partner_id in enumerate(partner_image_ids):
-            valid_partner_depths = self.compute_consistency_map_depths(points_3d, valid_mask, partner_id)
-            # partner_valid_maps[partner_id] = valid_partner_depths
-            consistency_map += (valid_partner_depths[:, :, 2] > 0).astype(np.float32)
-
-        # self.fusion.fuse_depth_maps(image_id, partner_valid_maps)
+            partner_map = self.compute_consistency_map_depths(points_3d, valid_mask, partner_id)
+            valid_partner_maps[partner_id] = partner_map
+            consistency_map += (partner_map[:, :, 2] > 0).astype(np.float32)
+        
+        if self.fusion_run_flag:
+            self.fuse_depth_maps(image_id, valid_partner_maps)
 
         depth_data['consistency_map'] = consistency_map
-        
-    def fuse_depth_maps(self, image_id: int, partner_valid_maps: dict) -> None:
 
+
+    def uvd_to_world_frame(self, image_id: int, uvd_map: np.ndarray) -> np.ndarray:
+        """
+        Convert uvd map to world frame.
+        
+        Args:
+            image_id: ID of the image
+            uvd_map: HxWx3 array containing [u, v, depth] coordinates
+            
+        Returns:
+            xyz_map: HxWx3 array containing [x, y, z] world coordinates (0 for invalid points)
+        """
+        depth_data = self.get_depth_data(image_id)
+        pose = depth_data['camera_pose']  # cam_from_world (4x4)
+        intrinsics = depth_data['camera_intrinsics']  # 3x3
+        
+        # Initialize output array
+        H, W = uvd_map.shape[:2]
+        xyz_map = np.zeros((H, W, 3), dtype=np.float32)
+        
+        # Extract valid points where depth > 0
+        valid_mask = uvd_map[:, :, 2] > 0
+        if not np.any(valid_mask):
+            return xyz_map
+        
+        # Get valid uvd coordinates
+        valid_u = uvd_map[valid_mask, 0]  # u coordinates
+        valid_v = uvd_map[valid_mask, 1]  # v coordinates  
+        valid_d = uvd_map[valid_mask, 2]  # depth values
+        
+        # Extract intrinsic parameters
+        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+        
+        # Convert to camera coordinates
+        x_cam = (valid_u - cx) * valid_d / fx
+        y_cam = (valid_v - cy) * valid_d / fy
+        z_cam = valid_d
+        
+        # Stack into homogeneous coordinates (Nx4)
+        cam_coords_homo = np.stack([x_cam, y_cam, z_cam, np.ones_like(x_cam)], axis=1)
+        
+        # Transform to world coordinates using inverse pose
+        # pose is cam_from_world, so we need world_from_cam = inv(cam_from_world)
+        world_from_cam = np.linalg.inv(pose)
+        world_coords = (world_from_cam @ cam_coords_homo.T).T[:, :3]  # (N, 3)
+        
+        # Put world coordinates back into the HxW grid
+        xyz_map[valid_mask] = world_coords
+        
+        return xyz_map
+
+    def fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:
         depth_data = self.get_depth_data(image_id)
         depth_map = depth_data['depth_map']
         if depth_map is None:
             return
 
+        img_pts3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
 
+        # Initialize accumulators for averaging
+        points_sum = np.zeros_like(img_pts3d, dtype=np.float64)  # Use float64 for precision
+        points_count = np.zeros((self.target_size, self.target_size), dtype=np.int32)
         
-
+        # Add main image's 3D points where valid
+        points_sum[valid_mask] += img_pts3d[valid_mask]
+        points_count[valid_mask] += 1
+        
+        # Add partner 3D points where valid
+        for partner_id, partner_map in valid_partner_maps.items():
+            partner_points_3d = self.uvd_to_world_frame(partner_id, partner_map)
+            partner_valid_mask = partner_map[:, :, 2] > 0
+            
+            # Add partner points where they are valid
+            points_sum[partner_valid_mask] += partner_points_3d[partner_valid_mask]
+            points_count[partner_valid_mask] += 1
+        
+        # Compute average 3D points (avoid division by zero)
+        fused_points_3d = np.zeros_like(img_pts3d, dtype=np.float32)
+        has_points_mask = points_count > self.fusion_min_consistency_count
+        fused_points_3d[has_points_mask] = (points_sum[has_points_mask] / points_count[has_points_mask, None]).astype(np.float32)
+        
+        # Convert fused 3D points back to depth map for the main image
+        # Extract valid 3D points for compute_depthmap (expects Nx3, not HxWx3)
+        valid_fused_mask = np.any(fused_points_3d != 0, axis=2)
+        if np.any(valid_fused_mask):
+            valid_fused_points = fused_points_3d[valid_fused_mask]
+            fused_depth_map = compute_depthmap(
+                valid_fused_points, 
+                depth_data['camera_intrinsics'], 
+                depth_data['camera_pose'], 
+                self.target_size
+            )
+        else:
+            fused_depth_map = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+            
+        depth_data['fused_depth_map'] = fused_depth_map
 
 
     def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
@@ -757,14 +845,14 @@ class DensificationProblem:
         
         return consistency_map
 
-    def compute_consistency(self) -> None:
+    def compute_consistency(self, run_fusion: bool=False) -> None:
+        self.fusion_run_flag = run_fusion
         self.parallel_executor.run_in_parallel_no_return(
             self.compute_consistency_image,
             self.active_image_ids,
             progress_desc="Computing consistency",
-            max_workers=2  # Reduce workers to avoid CPU thrashing
+            max_workers=4  # Reduce workers to avoid CPU thrashing
         )
-
 
     def _save_single_result(self, image_id: int, tag: str = "") -> None:
         """Save all results for a single image."""
@@ -773,12 +861,13 @@ class DensificationProblem:
         self.save_cloud(image_id, file_name=f"{tag}cloud{image_id:06d}.ply")
         self.save_cloud(image_id, consistent_points=True, file_name=f"{tag}consistent_cloud{image_id:06d}.ply")
         self.save_cloud(image_id, use_prior_depth=True, file_name=f"{tag}prior_cloud{image_id:06d}.ply")
+        self.save_cloud(image_id, use_fused_depth=True, file_name=f"{tag}fused_cloud{image_id:06d}.ply")
 
     def save_results(self) -> None:
         self.parallel_executor.run_in_parallel_no_return(
             self._save_single_result,
             self.active_image_ids,
             progress_desc="Saving results",
-            max_workers=2
+            max_workers=4
         )
 
