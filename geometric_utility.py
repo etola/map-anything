@@ -5,6 +5,57 @@ import matplotlib.cm as cm
 
 from PIL import Image
 
+
+def uvd_to_world_frame(depth_map: np.ndarray, intrinsics: np.ndarray, pose: np.ndarray, uvd_map: np.ndarray) -> np.ndarray:
+    """
+    Convert uvd map to world frame.
+    
+    Args:
+        depth_map: HxW numpy array
+        intrinsics: 3x3 numpy array
+        pose: 4x4 numpy array
+        uvd_map: HxWx3 array containing [u, v, depth] coordinates
+        
+    Returns:
+        xyz_map: HxWx3 array containing [x, y, z] world coordinates (0 for invalid points)
+    """
+    # Initialize output array
+    H, W = uvd_map.shape[:2]
+    xyz_map = np.zeros((H, W, 3), dtype=np.float32)
+    
+    # Extract valid points where depth > 0
+    valid_mask = uvd_map[:, :, 2] > 0
+    if not np.any(valid_mask):
+        return xyz_map
+    
+    # Get valid uvd coordinates
+    valid_u = uvd_map[valid_mask, 0]  # u coordinates
+    valid_v = uvd_map[valid_mask, 1]  # v coordinates
+    valid_d = uvd_map[valid_mask, 2]  # depth values
+    
+    # Extract intrinsic parameters
+    fx, fy = intrinsics[0, 0], intrinsics[1, 1]
+    cx, cy = intrinsics[0, 2], intrinsics[1, 2]
+    
+    # Convert to camera coordinates
+    x_cam = (valid_u - cx) * valid_d / fx
+    y_cam = (valid_v - cy) * valid_d / fy
+    z_cam = valid_d
+    
+    # Stack into homogeneous coordinates (Nx4)
+    cam_coords_homo = np.stack([x_cam, y_cam, z_cam, np.ones_like(x_cam)], axis=1)
+    
+    # Transform to world coordinates using inverse pose
+    # pose is cam_from_world, so we need world_from_cam = inv(cam_from_world)
+    world_from_cam = np.linalg.inv(pose)
+    world_coords = (world_from_cam @ cam_coords_homo.T).T[:, :3]  # (N, 3)
+    
+    # Put world coordinates back into the HxW grid
+    xyz_map[valid_mask] = world_coords
+    
+    return xyz_map
+
+
 def compute_depthmap(points_3d, intrinsics, cam_from_world, target_size):
     """
     Project 3D points to depth map in camera coordinate system.

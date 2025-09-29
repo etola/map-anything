@@ -11,7 +11,7 @@ import open3d as o3d
 
 from typing import List
 
-from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap
+from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap, uvd_to_world_frame
 
 
 class ParallelExecutor:
@@ -642,7 +642,6 @@ class DensificationProblem:
 
         depth_data['consistency_map'] = consistency_map
 
-
     def uvd_to_world_frame(self, image_id: int, uvd_map: np.ndarray) -> np.ndarray:
         """
         Convert uvd map to world frame.
@@ -657,42 +656,7 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
         pose = depth_data['camera_pose']  # cam_from_world (4x4)
         intrinsics = depth_data['camera_intrinsics']  # 3x3
-        
-        # Initialize output array
-        H, W = uvd_map.shape[:2]
-        xyz_map = np.zeros((H, W, 3), dtype=np.float32)
-        
-        # Extract valid points where depth > 0
-        valid_mask = uvd_map[:, :, 2] > 0
-        if not np.any(valid_mask):
-            return xyz_map
-        
-        # Get valid uvd coordinates
-        valid_u = uvd_map[valid_mask, 0]  # u coordinates
-        valid_v = uvd_map[valid_mask, 1]  # v coordinates  
-        valid_d = uvd_map[valid_mask, 2]  # depth values
-        
-        # Extract intrinsic parameters
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-        
-        # Convert to camera coordinates
-        x_cam = (valid_u - cx) * valid_d / fx
-        y_cam = (valid_v - cy) * valid_d / fy
-        z_cam = valid_d
-        
-        # Stack into homogeneous coordinates (Nx4)
-        cam_coords_homo = np.stack([x_cam, y_cam, z_cam, np.ones_like(x_cam)], axis=1)
-        
-        # Transform to world coordinates using inverse pose
-        # pose is cam_from_world, so we need world_from_cam = inv(cam_from_world)
-        world_from_cam = np.linalg.inv(pose)
-        world_coords = (world_from_cam @ cam_coords_homo.T).T[:, :3]  # (N, 3)
-        
-        # Put world coordinates back into the HxW grid
-        xyz_map[valid_mask] = world_coords
-        
-        return xyz_map
+        return uvd_to_world_frame(depth_data['depth_map'], intrinsics, pose, uvd_map)
 
     def fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:
         depth_data = self.get_depth_data(image_id)
@@ -739,7 +703,6 @@ class DensificationProblem:
             fused_depth_map = np.zeros((self.target_size, self.target_size), dtype=np.float32)
             
         depth_data['fused_depth_map'] = fused_depth_map
-
 
     def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
         """
