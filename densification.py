@@ -770,23 +770,21 @@ class DensificationProblem:
                 save_point_cloud(pts_for_save, colors_for_save, os.path.join(self.cloud_folder, f"fusion_{image_id:06d}.ply"))
                 
                 print(f"Image {image_id}: Generated {len(consistent_points)} fused points")
-                print(f"Visibility stats: avg {np.mean([len(p.visible_partner_ids) for p in consistent_points]):.1f} views per point")
             else:
                 print(f"Image {image_id}: No consistent points found")
 
 
-
-
-
-
-
-
-
+         # Extract 3D points and colors for saving
+        if len(fused_points_array) > 0:
+            pts_for_save = np.array([p.X for p in fused_points_array])
+            colors_for_save = np.array([p.color for p in fused_points_array])
+            save_point_cloud(pts_for_save, colors_for_save, os.path.join(self.cloud_folder, f"fused.ply"))
             
-
-
-                
-
+            # Save in COLMAP format
+            colmap_output_dir = os.path.join(self.output_folder, "fused_colmap")
+            self.reconstruction.save_fused_points_colmap(fused_points_array, colmap_output_dir, self.target_size)
+        else:
+            print("No fused points found across all images")
 
 
     def deprecated_fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:

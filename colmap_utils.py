@@ -543,6 +543,322 @@ class ColmapReconstruction:
             'coverage_y': coverage_y
         }
 
+    def save_fused_points_colmap(self, fused_points_array: List, output_dir: str, target_size: int = 518) -> None:
+        """
+        Save fused points array in COLMAP format.
+        
+        Args:
+            fused_points_array: List of Point objects with X, color, and visible_partner_ids
+            output_dir: Directory to save COLMAP files
+            target_size: Target image size for UV coordinates
+        """
+        import os
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # Save cameras.txt
+        self._save_cameras_txt(output_dir, target_size)
+        
+        # Save images.txt and collect 2D observations
+        image_observations = self._save_images_txt_with_points(output_dir, fused_points_array, target_size)
+        
+        # Save points3d.txt
+        self._save_points3d_txt(output_dir, fused_points_array, image_observations)
+        
+        print(f"Saved {len(fused_points_array)} fused points to COLMAP format in {output_dir}")
+        
+        # Test loading the saved reconstruction
+        # self._test_saved_reconstruction(output_dir)
+
+    def _save_cameras_txt(self, output_dir: str, target_size: int) -> None:
+        """Save cameras.txt file"""
+        cameras_file = os.path.join(output_dir, "cameras.txt")
+        with open(cameras_file, 'w') as f:
+            f.write("# Camera list with one line of data per camera:\n")
+            f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+            f.write("# Number of cameras: {}\n".format(len(self.reconstruction.cameras)))
+            
+            for camera_id, camera in self.reconstruction.cameras.items():
+                # Scale intrinsics for target size
+                original_width, original_height = camera.width, camera.height
+                scale_x = target_size / original_width
+                scale_y = target_size / original_height
+                
+                # Get camera parameters and scale them
+                params = camera.params
+                model_name = camera.model.name  # Correct pycolmap API
+                
+                if model_name == "PINHOLE":
+                    # PINHOLE: fx, fy, cx, cy
+                    fx, fy, cx, cy = params
+                    scaled_params = [fx * scale_x, fy * scale_y, cx * scale_x, cy * scale_y]
+                elif model_name == "SIMPLE_PINHOLE":
+                    # SIMPLE_PINHOLE: f, cx, cy
+                    f, cx, cy = params
+                    # Use same focal length for both axes when scaling
+                    scaled_f = f * (scale_x + scale_y) / 2
+                    scaled_params = [scaled_f, cx * scale_x, cy * scale_y]
+                else:
+                    # For other models, scale appropriately
+                    scaled_params = list(params)
+                    scaled_params[0] *= scale_x  # fx
+                    if len(scaled_params) > 1:
+                        scaled_params[1] *= scale_y  # fy
+                    if len(scaled_params) > 2:
+                        scaled_params[2] *= scale_x  # cx
+                    if len(scaled_params) > 3:
+                        scaled_params[3] *= scale_y  # cy
+                
+                params_str = " ".join([f"{p:.6f}" for p in scaled_params])
+                f.write(f"{camera_id} {model_name} {target_size} {target_size} {params_str}\n")
+
+    def _save_images_txt_with_points(self, output_dir: str, fused_points_array: List, target_size: int) -> Dict:
+        """Save images.txt file and return image observations for points"""
+        images_file = os.path.join(output_dir, "images.txt")
+        image_observations = {}  # point_idx -> [(image_id, point2d_idx), ...]
+        
+        with open(images_file, 'w') as f:
+            f.write("# Image list with two lines of data per image:\n")
+            f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+            f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+            f.write("# Number of images: {}\n".format(len(self.reconstruction.images)))
+            
+            for image_id, image in self.reconstruction.images.items():
+                # Get pose as quaternion and translation using correct pycolmap API
+                quat = image.cam_from_world.rotation.quat  # [qw, qx, qy, qz]
+                trans = image.cam_from_world.translation    # [tx, ty, tz]
+                
+                qx, qy, qz, qw = quat
+                tx, ty, tz = trans
+                f.write(f"{image_id} {qw:.6f} {qx:.6f} {qy:.6f} {qz:.6f} {tx:.6f} {ty:.6f} {tz:.6f} {image.camera_id} {image.name}\n")
+                
+                # Collect 2D observations for this image
+                points2d_line = []
+                point2d_idx = 0
+                
+                for point_idx, point in enumerate(fused_points_array):
+                    if image_id in point.visible_partner_ids:
+                        # Project 3D point to this image to get UV coordinates
+                        uv = self._project_point_to_image(point.X, image_id, target_size)
+                        if uv is not None:
+                            u, v = uv
+                            # Add to 2D points list: X Y POINT3D_ID
+                            points2d_line.append(f"{u:.2f} {v:.2f} {point_idx}")
+                            
+                            # Track this observation for the 3D point
+                            if point_idx not in image_observations:
+                                image_observations[point_idx] = []
+                            image_observations[point_idx].append((image_id, point2d_idx))
+                            point2d_idx += 1
+                
+                # Write 2D points line
+                if points2d_line:
+                    f.write(" ".join(points2d_line) + "\n")
+                else:
+                    f.write("\n")
+        
+        return image_observations
+
+    def _save_points3d_txt(self, output_dir: str, fused_points_array: List, image_observations: Dict) -> None:
+        """Save points3D.txt file"""
+        points3d_file = os.path.join(output_dir, "points3D.txt")
+        with open(points3d_file, 'w') as f:
+            f.write("# 3D point list with one line of data per point:\n")
+            f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+            f.write("# Number of points: {}\n".format(len(fused_points_array)))
+            
+            for point_idx, point in enumerate(fused_points_array):
+                # 3D coordinates
+                x, y, z = point.X
+                
+                # Color (convert from [0,1] to [0,255])
+                r, g, b = (point.color * 255).astype(int)
+                r, g, b = np.clip([r, g, b], 0, 255)
+                
+                # Error (dummy value)
+                error = 0.0
+                
+                # Track: list of (IMAGE_ID, POINT2D_IDX) observations
+                track = []
+                if point_idx in image_observations:
+                    for image_id, point2d_idx in image_observations[point_idx]:
+                        track.append(f"{image_id} {point2d_idx}")
+                
+                track_str = " ".join(track) if track else ""
+                f.write(f"{point_idx} {x:.6f} {y:.6f} {z:.6f} {r} {g} {b} {error:.6f} {track_str}\n")
+
+    def _project_point_to_image(self, point_3d: np.ndarray, image_id: int, target_size: int) -> Optional[Tuple[float, float]]:
+        """Project 3D point to image coordinates"""
+        try:
+            # Get camera parameters
+            intrinsics = self.get_camera_calibration_matrix(image_id)
+            pose = self.get_image_cam_from_world(image_id)
+            
+            # Scale intrinsics for target size
+            image = self.reconstruction.images[image_id]
+            camera = self.reconstruction.cameras[image.camera_id]
+            original_width, original_height = camera.width, camera.height
+            scale_x = target_size / original_width
+            scale_y = target_size / original_height
+            intrinsics_scaled = intrinsics.copy()
+            intrinsics_scaled[0, :] *= scale_x  # Scale fx and cx
+            intrinsics_scaled[1, :] *= scale_y  # Scale fy and cy
+            
+            # Transform to camera coordinates
+            point_homo = np.append(point_3d, 1.0)
+            cam_coords = pose.matrix() @ point_homo
+            
+            # Check if point is in front of camera
+            if cam_coords[2] <= 0:
+                return None
+                
+            # Project to image plane
+            proj_coords = intrinsics_scaled @ cam_coords
+            u = proj_coords[0] / proj_coords[2]
+            v = proj_coords[1] / proj_coords[2]
+            
+            # Check if within image bounds
+            if 0 <= u < target_size and 0 <= v < target_size:
+                return (u, v)
+            else:
+                return None
+                
+        except Exception as e:
+            print(f"Error projecting point to image {image_id}: {e}")
+            return None
+
+    def _test_saved_reconstruction(self, output_dir: str) -> None:
+        """Test loading the saved COLMAP reconstruction to verify correctness"""
+        try:
+            print(f"Testing saved COLMAP reconstruction in {output_dir}...")
+            
+            # Try to load the reconstruction using pycolmap
+            test_reconstruction = pycolmap.Reconstruction(output_dir)
+            
+            print(f"✓ Successfully loaded COLMAP reconstruction!")
+            print(f"  - Cameras: {len(test_reconstruction.cameras)}")
+            print(f"  - Images: {len(test_reconstruction.images)}")
+            print(f"  - Points3D: {len(test_reconstruction.points3D)}")
+            
+            # Verify some basic properties
+            if len(test_reconstruction.cameras) == 0:
+                print("⚠ Warning: No cameras found in reconstruction")
+            if len(test_reconstruction.images) == 0:
+                print("⚠ Warning: No images found in reconstruction")
+            if len(test_reconstruction.points3D) == 0:
+                print("⚠ Warning: No 3D points found in reconstruction")
+            
+            # Test a few specific things
+            for camera_id, camera in test_reconstruction.cameras.items():
+                print(f"  Camera {camera_id}: {camera.model.name}, {camera.width}x{camera.height}")
+                break  # Just show first camera
+                
+            for image_id, image in test_reconstruction.images.items():
+                print(f"  Image {image_id}: {image.name}, camera_id={image.camera_id}")
+                print(f"    2D points: {len(image.points2D)}")
+                break  # Just show first image
+                
+            # Verify poses match the original reconstruction
+            self._verify_poses_match(test_reconstruction)
+                
+            # Test point cloud statistics
+            if len(test_reconstruction.points3D) > 0:
+                points = np.array([pt.xyz for pt in test_reconstruction.points3D.values()])
+                print(f"  Points3D bounds: X[{points[:, 0].min():.2f}, {points[:, 0].max():.2f}], "
+                      f"Y[{points[:, 1].min():.2f}, {points[:, 1].max():.2f}], "
+                      f"Z[{points[:, 2].min():.2f}, {points[:, 2].max():.2f}]")
+                
+                # Check track lengths
+                track_lengths = [len(pt.track.elements) for pt in test_reconstruction.points3D.values()]
+                avg_track_length = np.mean(track_lengths)
+                print(f"  Average track length: {avg_track_length:.1f} views per point")
+            
+            print("✓ COLMAP reconstruction validation completed successfully!")
+            
+        except Exception as e:
+            print(f"✗ Error loading saved COLMAP reconstruction: {e}")
+            print("This indicates the saved files may have formatting issues.")
+            
+            # Try to give more specific error info
+            cameras_file = os.path.join(output_dir, "cameras.txt")
+            images_file = os.path.join(output_dir, "images.txt")
+            points_file = os.path.join(output_dir, "points3D.txt")
+            
+            for filepath in [cameras_file, images_file, points_file]:
+                if not os.path.exists(filepath):
+                    print(f"  Missing file: {filepath}")
+                else:
+                    try:
+                        with open(filepath, 'r') as f:
+                            lines = f.readlines()
+                        print(f"  {os.path.basename(filepath)}: {len(lines)} lines")
+                    except Exception as read_error:
+                        print(f"  Error reading {filepath}: {read_error}")
+
+    def _verify_poses_match(self, test_reconstruction) -> None:
+        """Verify that poses in the loaded reconstruction match the original"""
+        print("  Verifying camera poses...")
+        
+        pose_errors = []
+        rotation_errors = []
+        translation_errors = []
+        
+        # Sample a few images to check poses
+        sample_images = list(self.reconstruction.images.keys())[:min(5, len(self.reconstruction.images))]
+        
+        for image_id in sample_images:
+            if image_id not in test_reconstruction.images:
+                print(f"    ⚠ Image {image_id} missing in loaded reconstruction")
+                continue
+                
+            # Get original pose
+            orig_image = self.reconstruction.images[image_id]
+            orig_quat = orig_image.cam_from_world.rotation.quat
+            orig_trans = orig_image.cam_from_world.translation
+            
+            # Get loaded pose
+            test_image = test_reconstruction.images[image_id]
+            test_quat = test_image.cam_from_world.rotation.quat
+            test_trans = test_image.cam_from_world.translation
+            
+            # Debug: print actual quaternion values for first mismatch
+            if len(pose_errors) == 0:  # Only for first image to avoid spam
+                print(f"    Debug image {image_id}:")
+                print(f"      Original quat: [{orig_quat[0]:.6f}, {orig_quat[1]:.6f}, {orig_quat[2]:.6f}, {orig_quat[3]:.6f}]")
+                print(f"      Loaded quat:   [{test_quat[0]:.6f}, {test_quat[1]:.6f}, {test_quat[2]:.6f}, {test_quat[3]:.6f}]")
+                print(f"      Original trans: [{orig_trans[0]:.6f}, {orig_trans[1]:.6f}, {orig_trans[2]:.6f}]")
+                print(f"      Loaded trans:   [{test_trans[0]:.6f}, {test_trans[1]:.6f}, {test_trans[2]:.6f}]")
+            
+            # Compare quaternions
+            quat_diff = np.linalg.norm(np.array(orig_quat) - np.array(test_quat))
+            rotation_errors.append(quat_diff)
+            
+            # Compare translations
+            trans_diff = np.linalg.norm(np.array(orig_trans) - np.array(test_trans))
+            translation_errors.append(trans_diff)
+            
+            total_error = quat_diff + trans_diff
+            pose_errors.append(total_error)
+            
+            if total_error > 1e-6:  # Threshold for "different" poses
+                print(f"    ⚠ Pose mismatch for image {image_id}: rot_diff={quat_diff:.2e}, trans_diff={trans_diff:.2e}")
+        
+        if pose_errors:
+            avg_rotation_error = np.mean(rotation_errors)
+            avg_translation_error = np.mean(translation_errors)
+            max_pose_error = np.max(pose_errors)
+            
+            if max_pose_error < 1e-6:
+                print(f"    ✓ Poses match perfectly! (max error: {max_pose_error:.2e})")
+            elif max_pose_error < 1e-3:
+                print(f"    ✓ Poses match well (max error: {max_pose_error:.2e})")
+                print(f"      Avg rotation error: {avg_rotation_error:.2e}, translation error: {avg_translation_error:.2e}")
+            else:
+                print(f"    ✗ Pose errors detected! Max error: {max_pose_error:.2e}")
+                print(f"      Avg rotation error: {avg_rotation_error:.2e}, translation error: {avg_translation_error:.2e}")
+        else:
+            print("    ⚠ No valid poses to compare")
+
+
 
 
 
