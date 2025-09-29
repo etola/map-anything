@@ -545,7 +545,7 @@ class ColmapReconstruction:
 
     def save_fused_points_colmap(self, fused_points_array: List, output_dir: str, target_size: int = 518) -> None:
         """
-        Save fused points array in COLMAP format.
+        Save fused points array in COLMAP binary format.
         
         Args:
             fused_points_array: List of Point objects with X, color, and visible_partner_ids
@@ -555,19 +555,178 @@ class ColmapReconstruction:
         import os
         os.makedirs(output_dir, exist_ok=True)
         
-        # Save cameras.txt
-        self._save_cameras_txt(output_dir, target_size)
+        # Create a new reconstruction object
+        fused_reconstruction = pycolmap.Reconstruction()
         
-        # Save images.txt and collect 2D observations
-        image_observations = self._save_images_txt_with_points(output_dir, fused_points_array, target_size)
+        # Add cameras with scaled intrinsics
+        self._add_cameras_to_reconstruction(fused_reconstruction, target_size)
         
-        # Save points3d.txt
-        self._save_points3d_txt(output_dir, fused_points_array, image_observations)
+        # Add images with poses
+        self._add_images_to_reconstruction(fused_reconstruction)
         
-        print(f"Saved {len(fused_points_array)} fused points to COLMAP format in {output_dir}")
+        # Add 3D points with tracks
+        self._add_points_to_reconstruction(fused_reconstruction, fused_points_array, target_size)
+        
+        # Save in binary format
+        fused_reconstruction.write(output_dir)
+        
+        print(f"Saved {len(fused_points_array)} fused points to COLMAP binary format in {output_dir}")
         
         # Test loading the saved reconstruction
-        # self._test_saved_reconstruction(output_dir)
+        self._test_saved_reconstruction(output_dir)
+
+    def _add_cameras_to_reconstruction(self, reconstruction, target_size: int) -> None:
+        """Add cameras to reconstruction with scaled intrinsics"""
+        for camera_id, camera in self.reconstruction.cameras.items():
+            # Scale intrinsics for target size
+            original_width, original_height = camera.width, camera.height
+            scale_x = target_size / original_width
+            scale_y = target_size / original_height
+            
+            # Get camera parameters and scale them
+            params = list(camera.params)
+            model_name = camera.model.name
+            
+            if model_name == "PINHOLE":
+                # PINHOLE: fx, fy, cx, cy
+                params[0] *= scale_x  # fx
+                params[1] *= scale_y  # fy
+                params[2] *= scale_x  # cx
+                params[3] *= scale_y  # cy
+            elif model_name == "SIMPLE_PINHOLE":
+                # SIMPLE_PINHOLE: f, cx, cy
+                params[0] = params[0] * (scale_x + scale_y) / 2  # f
+                params[1] *= scale_x  # cx
+                params[2] *= scale_y  # cy
+            else:
+                # For other models, scale first 4 parameters
+                if len(params) > 0: params[0] *= scale_x  # fx
+                if len(params) > 1: params[1] *= scale_y  # fy
+                if len(params) > 2: params[2] *= scale_x  # cx
+                if len(params) > 3: params[3] *= scale_y  # cy
+            
+            # Create new camera object
+            new_camera = pycolmap.Camera(
+                camera_id=camera_id,
+                model=camera.model,
+                width=target_size,
+                height=target_size,
+                params=params
+            )
+            
+            # Add camera to reconstruction
+            reconstruction.add_camera(new_camera)
+
+    def _add_images_to_reconstruction(self, reconstruction) -> None:
+        """Add images to reconstruction with their poses"""
+        print(f"Adding {len(self.reconstruction.images)} images to reconstruction...")
+        
+        for image_id, image in self.reconstruction.images.items():
+            try:
+                # Try using the add_image method with the original image first
+                reconstruction.add_image(image)
+                print(f"  Added image {image_id}: {image.name}")
+                
+            except Exception as e:
+                print(f"  Failed to add image {image_id} directly: {e}")
+                try:
+                    # Fallback: create new image with proper initialization
+                    new_image = pycolmap.Image()
+                    new_image.name = image.name
+                    new_image.camera_id = image.camera_id
+                    new_image.cam_from_world = image.cam_from_world
+                    
+                    # Initialize empty points2D list if needed
+                    if not hasattr(new_image, 'points2D'):
+                        new_image.points2D = []
+                    
+                    # Add using the method
+                    reconstruction.add_image(new_image)
+                    print(f"  Added image {image_id} via fallback: {image.name}")
+                    
+                except Exception as e2:
+                    print(f"  Failed to add image {image_id} via fallback: {e2}")
+                
+        print(f"Final image count: {len(reconstruction.images)}")
+        
+        # Double-check that images are properly registered
+        print(f"Reconstruction stats after adding images:")
+        print(f"  num_reg_images: {reconstruction.num_reg_images}")
+        print(f"  Images dict length: {len(reconstruction.images)}")
+        
+        # Try to register the images if they aren't registered
+        if reconstruction.num_reg_images == 0 and len(reconstruction.images) > 0:
+            print("  Attempting to register images...")
+            for image_id, img in reconstruction.images.items():
+                try:
+                    # Set the image as registered
+                    img.registered = True
+                    print(f"    Registered image {image_id}")
+                except Exception as e:
+                    print(f"    Failed to register image {image_id}: {e}")
+
+    def _add_points_to_reconstruction(self, reconstruction, fused_points_array: List, target_size: int) -> None:
+        """Add 3D points to reconstruction with proper tracks"""
+        print(f"Adding {len(fused_points_array)} 3D points with tracks...")
+        
+        # First pass: collect all 2D observations and add them to images
+        point_to_observations = {}  # point_idx -> [(image_id, point2d_idx), ...]
+        
+        for point_idx, point in enumerate(fused_points_array):
+            observations = []
+            
+            for image_id in point.visible_partner_ids:
+                if image_id in reconstruction.images:
+                    # Project 3D point to get 2D coordinates
+                    uv = self._project_point_to_image(point.X, image_id, target_size)
+                    if uv is not None:
+                        # Get the image and add 2D point
+                        image = reconstruction.images[image_id]
+                        
+                        # Add 2D point to image's points2D list
+                        if not hasattr(image, 'points2D') or image.points2D is None:
+                            image.points2D = []
+                        
+                        point2d_idx = len(image.points2D)
+                        # Create Point2D object
+                        point2d = pycolmap.Point2D(xy=uv, point3D_id=point_idx)
+                        image.points2D.append(point2d)
+                        
+                        # Track this observation
+                        observations.append((image_id, point2d_idx))
+            
+            point_to_observations[point_idx] = observations
+        
+        # Second pass: create 3D points with proper tracks
+        for point_idx, point in enumerate(fused_points_array):
+            # Convert color from [0,1] to [0,255]
+            color = (point.color * 255).astype(int)
+            color = np.clip(color, 0, 255)
+            
+            # Create track from observations
+            track_elements = []
+            for image_id, point2d_idx in point_to_observations[point_idx]:
+                track_elements.append(pycolmap.TrackElement(image_id, point2d_idx))
+            
+            track = pycolmap.Track(track_elements)
+            
+            # Create 3D point
+            point3D = pycolmap.Point3D(
+                xyz=point.X,
+                color=color,
+                track=track
+            )
+            
+            # Add 3D point with specific ID
+            reconstruction.points3D[point_idx] = point3D
+        
+        print(f"Added {len(fused_points_array)} 3D points with tracks")
+        
+        # Verify track statistics
+        track_lengths = [len(pt.track.elements) for pt in reconstruction.points3D.values()]
+        if track_lengths:
+            avg_track_length = sum(track_lengths) / len(track_lengths)
+            print(f"Average track length: {avg_track_length:.1f} views per point")
 
     def _save_cameras_txt(self, output_dir: str, target_size: int) -> None:
         """Save cameras.txt file"""
