@@ -205,13 +205,14 @@ def main():
 
     densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.output_folder)
 
-    # densification_problem.initialize_from_folder()
+    densification_problem.initialize_from_folder()
+    densification_problem.apply_fusion()
     # densification_problem.compute_consistency_image(122)
     # densification_problem._save_single_result(122, tag="new_")
 
 
-    if args.reference_reconstruction is not None:
-        densification_problem.initialize_with_reference(args.reference_reconstruction)
+    # if args.reference_reconstruction is not None:
+    #     densification_problem.initialize_with_reference(args.reference_reconstruction)
 
     # Initialize model
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -241,8 +242,10 @@ def main():
             # Clear GPU memory
             torch.cuda.empty_cache()
         
-    densification_problem.compute_consistency(run_fusion=True)
-    densification_problem.save_results()
+    # densification_problem.compute_consistency(run_fusion=True)
+    # densification_problem.save_results()
+
+
 
 
 if __name__ == "__main__":

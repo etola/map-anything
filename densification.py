@@ -14,6 +14,8 @@ from typing import List
 from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap, uvd_to_world_frame
 
 
+
+
 class ParallelExecutor:
     """
     Generic parallel executor for running functions with image IDs in parallel.
@@ -656,9 +658,138 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
         pose = depth_data['camera_pose']  # cam_from_world (4x4)
         intrinsics = depth_data['camera_intrinsics']  # 3x3
-        return uvd_to_world_frame(depth_data['depth_map'], intrinsics, pose, uvd_map)
+        return uvd_to_world_frame(uvd_map, intrinsics, pose)
 
-    def fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:
+
+    class Point:
+        def __init__(self, X, color):
+            self.X = X
+            self.color = color
+            self.visible_partner_ids = []
+        def add_partner_id(self, partner_id):
+            self.visible_partner_ids.append(partner_id)
+
+
+    def apply_fusion(self):
+
+        for image_id in self.active_image_ids:
+            depth_data = self.get_depth_data(image_id)
+            depth_data['active_mask'] = depth_data['depth_map'] > 0
+
+        fused_points_array = []
+
+        for image_id in self.active_image_ids:
+
+            print(f"Processing image for fusion: {image_id}")
+
+            depth_data = self.get_depth_data(image_id)
+            pts3d, valid_mask = depthmap_to_world_frame(depth_data['depth_map'], depth_data['camera_intrinsics'], depth_data['camera_pose'])
+
+            valid_mask = valid_mask & depth_data['active_mask']
+
+            # project each valid point onto partner images and check if the projected point's depth is consistent with
+            # the partner's depth map.
+
+            accumulated_pts3d = np.zeros_like(pts3d, dtype=np.float32)
+            accumulated_pts3d[valid_mask] = pts3d[valid_mask]
+            accumulated_valid_mask = (valid_mask).astype(np.uint8)
+
+            H, W = depth_data['depth_map'].shape
+            partner_uvd_maps = {}
+
+            partner_image_ids = depth_data['partner_image_ids']
+            for partner_id in partner_image_ids:
+                partner_data = self.get_depth_data(partner_id)
+
+                partner_uvd = self.compute_consistency_map_depths(pts3d, valid_mask, partner_id)
+                partner_uvd_maps[partner_id] = partner_uvd
+
+                partner_valid_mask = valid_mask & (partner_uvd[:, :, 2] > 0).astype(np.uint8)
+                X = uvd_to_world_frame(partner_uvd, partner_data['camera_intrinsics'], partner_data['camera_pose'])
+                accumulated_valid_mask += partner_valid_mask.astype(np.uint8)
+                accumulated_pts3d[partner_valid_mask>0] += X[partner_valid_mask>0]
+
+            # export 3d points that have accumulated valid mask > fusion_min_consistency_count
+            consistency_mask = accumulated_valid_mask > self.fusion_min_consistency_count
+            if not np.any(consistency_mask):
+                print(f"Image {image_id}: No consistent points found")
+                continue
+            else:
+                print(f"Image {image_id}: Found {np.sum(consistency_mask)} consistent points")
+
+            # average point by the number of accumulated valid masks per pixel
+            fused_pts3d = np.zeros_like(pts3d, dtype=np.float32)
+            # For consistent pixels, divide accumulated 3D points by their count
+            consistent_counts = accumulated_valid_mask[consistency_mask]
+            consistent_accumulated_pts = accumulated_pts3d[consistency_mask]
+            fused_pts3d[consistency_mask] = consistent_accumulated_pts / consistent_counts[:, None]
+
+
+            # Generate points array for the fused consistent points
+            consistent_points = []
+            consistent_positions = np.where(consistency_mask)
+            
+            for i, (y, x) in enumerate(zip(consistent_positions[0], consistent_positions[1])):
+                # Create Point object with 3D position and color
+                point_3d = fused_pts3d[y, x]
+                color = depth_data['scaled_image'][y, x]/255.0
+
+                point = self.Point(point_3d, color)
+                
+                # Add main image as visible
+                point.add_partner_id(image_id)
+
+
+                # Check visibility in partner images
+                visibility = 1
+                for partner_id, partner_uvd in partner_uvd_maps.items():
+                    # Check if this pixel has valid depth in partner and is consistent
+                    if partner_uvd[y, x, 2] > 0:  # Partner has valid depth at this pixel
+                        point.add_partner_id(partner_id)
+                        partner_data = self.get_depth_data(partner_id)
+                        uv = partner_uvd[y, x, :2]
+                        u0 = int(uv[0])
+                        v0 = int(uv[1])
+                        partner_data['active_mask'][v0, u0] = False # disable this pixel for future fusion as it is already used
+                        partner_color = partner_data['scaled_image'][v0, u0]/255.0
+                        color += partner_color
+                        visibility += 1
+
+                point.color = color / visibility
+
+                
+                consistent_points.append(point)
+
+            # Extract 3D points and colors for saving
+            if len(consistent_points) > 0:
+                fused_points_array.extend(consistent_points)
+                pts_for_save = np.array([p.X for p in consistent_points])
+                colors_for_save = np.array([p.color for p in consistent_points])
+                
+                # save the point cloud
+                save_point_cloud(pts_for_save, colors_for_save, os.path.join(self.cloud_folder, f"fusion_{image_id:06d}.ply"))
+                
+                print(f"Image {image_id}: Generated {len(consistent_points)} fused points")
+                print(f"Visibility stats: avg {np.mean([len(p.visible_partner_ids) for p in consistent_points]):.1f} views per point")
+            else:
+                print(f"Image {image_id}: No consistent points found")
+
+
+
+
+
+
+
+
+
+            
+
+
+                
+
+
+
+    def deprecated_fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:
         depth_data = self.get_depth_data(image_id)
         depth_map = depth_data['depth_map']
         if depth_map is None:

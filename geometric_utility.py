@@ -6,7 +6,7 @@ import matplotlib.cm as cm
 from PIL import Image
 
 
-def uvd_to_world_frame(depth_map: np.ndarray, intrinsics: np.ndarray, pose: np.ndarray, uvd_map: np.ndarray) -> np.ndarray:
+def uvd_to_world_frame(uvd_map: np.ndarray, intrinsics: np.ndarray, pose: np.ndarray) -> np.ndarray:
     """
     Convert uvd map to world frame.
     
