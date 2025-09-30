@@ -141,6 +141,7 @@ class DensificationProblem:
         'scaled_image'          : image_scaled in target_size x target_size,
         'depth_map'             : depth_map in target_size x target_size or None,
         'confidence_map'        : confidence_map in target_size x target_size or None,
+        'point_mask'            : point mask in target_size x target_size or None, (stores with points should be considered)
         'fused_depth_map'       : fused depth map in target_size x target_size or None,
         'prior_depth_map'       : prior depth map in target_size x target_size or None,
         'consistency_map'       : consistency map of the estimated depth map with the partner images map in target_size x target_size or None,
@@ -238,6 +239,7 @@ class DensificationProblem:
             'scaled_image': None,
             'depth_map': None,
             'confidence_map': None,
+            'point_mask': None,
             'prior_depth_map': None,
             'fused_depth_map': None,
             'consistency_map': None,
@@ -374,6 +376,11 @@ class DensificationProblem:
         depth_data['depth_map'] = depth_map
         depth_data['confidence_map'] = confidence_map
         depth_data['confidence_range'] = (np.min(confidence_map), np.max(confidence_map))
+
+        if depth_data['point_mask'] is None:
+            depth_data['point_mask'] = (depth_map > 0).astype(bool)
+        else:
+            depth_data['point_mask'] &= (depth_map > 0).astype(bool)
 
         target_size = depth_data['target_size']
         assert depth_map.shape == (target_size, target_size), f"Depth map shape {depth_map.shape} does not match target size {target_size}"
@@ -668,29 +675,83 @@ class DensificationProblem:
         fused_dmap = compute_depthmap(fused_pts3d[consistency_mask], depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_size)
 
         depth_data['fused_depth_map'] = fused_dmap
-        depth_data['point_mask'] = (fused_dmap > 0).astype(bool)
+
 
     def apply_fusion(self):
 
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
-            # True for active points --> can be used to mask out parts of the image that are not valid
-            # this should be initialized when we init the problem and clean out locations 
-            # --> can use confidence to filter at that stage (default is depthmap > 0)
-            depth_data['point_mask'] = (depth_data['depth_map'] > 0).astype(bool)
-            depth_data['fused_depth_map'] = np.zeros((self.target_size, self.target_size), dtype=np.float32)
+            # filter point mask by confidence here if you want
+            # depth_data['point_mask'] &= (depth_data['confidence_map'] > 0).astype(bool)
 
-        # for image_id in self.active_image_ids:
-        #     print(f"Fusion for image {image_id}")
-        #     self.fuse_for_image(image_id)
-
-        print(f"Fusion for {len(self.active_image_ids)} images")
         self.parallel_executor.run_in_parallel_no_return(
             self.fuse_for_image,
             self.active_image_ids,
             progress_desc="Fusing for images",
             max_workers=4
         )
+
+    def export_fused_point_cloud(self, stepping: int = 1, file_name: str = ""):
+
+        print(f"Exporting fused point cloud with stepping {stepping} and file name {file_name}")
+
+        pts_list = []
+        colors_list = []
+
+        for image_id in self.active_image_ids:
+            depth_data = self.get_depth_data(image_id)
+            depth_data['exported_mask'] = np.zeros((self.target_size, self.target_size), dtype=bool)
+
+        for image_id in self.active_image_ids:
+
+            depth_data = self.get_depth_data(image_id)
+            if depth_data['fused_depth_map'] is not None:
+                dmap = depth_data['fused_depth_map']
+                if dmap is None:
+                    continue
+
+                exported_mask = depth_data['exported_mask']
+
+                image_pts3d, valid_mask = depthmap_to_world_frame(dmap, depth_data['camera_intrinsics'], depth_data['camera_pose'])
+                # mark stepping pixels as invalid
+
+                # invalidate pixels that have already been exported
+                valid_mask &= ~exported_mask
+
+                # mark points that have been exported to partner images
+                for partner_id in depth_data['partner_image_ids']:
+                    partner_data = self.get_depth_data(partner_id)
+                    uvd = self.compute_consistency_map_depths(image_pts3d, valid_mask, partner_id)
+                    uv = uvd[ uvd[:,:,2] > 0, :2 ]
+                    if len(uv) == 0:
+                        continue
+                    uv = uv.astype(int)
+                    partner_data['exported_mask'][uv[:, 1], uv[:, 0]] = True
+
+                if stepping > 1:
+                    stepping_mask = np.zeros_like(valid_mask, dtype=bool)
+                    stepping_mask[::stepping, ::stepping] = True
+                    valid_mask = valid_mask & stepping_mask
+
+                pts3d = image_pts3d[valid_mask]
+                current_colors = np.ones((len(pts3d), 3), dtype=np.float32) * 0.5  # Gray color
+                if depth_data['scaled_image'] is not None:
+                    simg_array = np.array(depth_data['scaled_image'], dtype=np.float32) / 255.0  # Shape: (518, 518, 3)
+                    current_colors = simg_array[valid_mask]  # Shape: (N_valid_pixels, 3)
+
+                pts_list.append(pts3d)
+                colors_list.append(current_colors)
+
+        if pts_list:
+            pts = np.vstack(pts_list)
+            colors = np.vstack(colors_list)
+            if file_name:
+                cloud_file = os.path.join(self.cloud_folder, file_name)
+            else:
+                cloud_file = os.path.join(self.cloud_folder, "fused.ply")
+            save_point_cloud(pts, colors, cloud_file)
+        else:
+            print("No points to export")
 
     def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
         """
