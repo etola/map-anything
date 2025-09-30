@@ -205,42 +205,70 @@ def main():
 
     densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.output_folder)
 
-    # densification_problem.initialize_from_folder()
-
-    if args.reference_reconstruction is not None:
-        densification_problem.initialize_with_reference(args.reference_reconstruction)
-
-    # Initialize model
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
-    if args.apache:
-        model_name = "facebook/map-anything-apache"
-        print("Loading Apache 2.0 licensed MapAnything model...")
+    if densification_problem.is_precomputed_depth_data_present():
+        print("Precomputed depth data found, skipping initialization")
+        densification_problem.initialize_from_folder()
     else:
-        model_name = "facebook/map-anything"
-        print("Loading CC-BY-NC 4.0 licensed MapAnything model...")
-    model = MapAnything.from_pretrained(model_name).to(device)
-    model.eval()
+        print("No precomputed depth data found")
+        if args.reference_reconstruction is not None:
+            densification_problem.initialize_with_reference(args.reference_reconstruction)
 
-    if args.smart_batching:
-        print("Using smart batching based on COLMAP reconstruction quality...")
-        batches = densification_problem.get_batches_geometric(args.batch_size)
-        print(f"Processing {len(batches)} smart batches with max batch size {args.batch_size}")
-    else:
-        print("Using sequential batching...")
-        batches = densification_problem.get_batches_sequential(args.batch_size)
-        print(f"Processing {len(batches)} sequential batches with batch size {args.batch_size}")
-    
-    for batch_idx, batch_image_ids in enumerate(batches):
-        print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
-        with torch.no_grad():
-            run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
-            # Clear GPU memory
-            torch.cuda.empty_cache()
+        # Initialize model
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        print(f"Using device: {device}")
+        if args.apache:
+            model_name = "facebook/map-anything-apache"
+            print("Loading Apache 2.0 licensed MapAnything model...")
+        else:
+            model_name = "facebook/map-anything"
+            print("Loading CC-BY-NC 4.0 licensed MapAnything model...")
+        model = MapAnything.from_pretrained(model_name).to(device)
+        model.eval()
+
+        if args.smart_batching:
+            print("Using smart batching based on COLMAP reconstruction quality...")
+            batches = densification_problem.get_batches_geometric(args.batch_size)
+            print(f"Processing {len(batches)} smart batches with max batch size {args.batch_size}")
+        else:
+            print("Using sequential batching...")
+            batches = densification_problem.get_batches_sequential(args.batch_size)
+            print(f"Processing {len(batches)} sequential batches with batch size {args.batch_size}")
         
+        for batch_idx, batch_image_ids in enumerate(batches):
+            print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
+            with torch.no_grad():
+                run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
+                # Clear GPU memory
+                torch.cuda.empty_cache()
+
+        densification_problem.save_current_state()
 
     densification_problem.apply_fusion()
     densification_problem.export_fused_point_cloud(file_name="fused.ply")
+
+    # print("Running second iteration")
+    # densification_problem.transfer_fused_to_prior()
+    # for batch_idx, batch_image_ids in enumerate(batches):
+    #     print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
+    #     with torch.no_grad():
+    #         run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
+    #         # Clear GPU memory
+    #         torch.cuda.empty_cache()
+
+    # densification_problem.apply_fusion()
+    # densification_problem.export_fused_point_cloud(file_name="fused_2.ply")
+
+    # print("Running third iteration")
+    # densification_problem.transfer_fused_to_prior()
+    # for batch_idx, batch_image_ids in enumerate(batches):
+    #     print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
+    #     with torch.no_grad():
+    #         run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
+    #         # Clear GPU memory
+    #         torch.cuda.empty_cache()
+
+    # densification_problem.apply_fusion()
+    # densification_problem.export_fused_point_cloud(file_name="fused_3.ply")
 
     if args.verbose:
         densification_problem.save_results()

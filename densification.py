@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 import open3d as o3d
-
+import glob
 from typing import List
 
 from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap, uvd_to_world_frame
@@ -276,8 +276,11 @@ class DensificationProblem:
         assert self.reconstruction.has_image(image_id)
         return depth_data
 
+    def is_precomputed_depth_data_present(self) -> bool:
+        depth_data_files = glob.glob(os.path.join(self.depth_data_folder, "*.npz"))
+        return len(depth_data_files) > 0
+
     def initialize_from_folder(self):
-        import glob
         self.active_image_ids = []
         depth_data_files = glob.glob(os.path.join(self.depth_data_folder, "*.npz"))
         print(f"Loading {len(depth_data_files)} depth data files...")
@@ -307,12 +310,6 @@ class DensificationProblem:
         self.active_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if self.source_to_target_image_id_mapping[img_id] is not None and  self.source_to_target_image_id_mapping[img_id] in valid_target_image_ids]
         print(f"    Found {len(self.active_image_ids)}/{self.reconstruction.get_num_images()} active image ids")
 
-        # # missing image ids are the image ids that do not have a valid mapping from the source reconstruction to the reference reconstruction
-        # self.missing_image_ids = [img_id for img_id in self.reconstruction.get_all_image_ids() if img_id not in self.active_image_ids]
-        # print(f"Missing Image IDs: {self.missing_image_ids}")
-        # for img_id in self.missing_image_ids:
-        #     print(f"  {img_id}: {self.reconstruction.get_image_name(img_id)}")
-
         for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
 
@@ -329,14 +326,6 @@ class DensificationProblem:
             self.active_image_ids,
             progress_desc="Loading and Scaling Images"
         )
-
-        self.parallel_executor.run_in_parallel_no_return(
-            self.save_depth_data,
-            self.active_image_ids,
-            progress_desc="Saving initialized depth data",
-            max_workers=4
-        )
-
 
 
     def initialize_prior_depth_data_from_reference(self, image_id: int) -> None:
@@ -399,14 +388,13 @@ class DensificationProblem:
         filepath = os.path.join(self.depth_data_folder, f"depth_{image_id:06d}.npz")
         np.savez_compressed(filepath, **depth_data)
 
-    def save(self, max_workers: int = None) -> None:
+    def save_current_state(self, max_workers: int = 4) -> None:
         """
         Save all depth data files in parallel.
         Args:
             max_workers: Maximum number of worker threads for parallel saving.
         """
         img_ids = list(self.scene_depth_data.keys())
-        
         self.parallel_executor.run_in_parallel_no_return(
             self.save_depth_data,
             img_ids,
@@ -695,7 +683,7 @@ class DensificationProblem:
         self.parallel_executor.run_in_parallel_no_return(
             self.fuse_for_image,
             self.active_image_ids,
-            progress_desc="Fusing for images",
+            progress_desc="Fusing depth maps",
             max_workers=4
         )
 
@@ -970,4 +958,9 @@ class DensificationProblem:
             progress_desc="Saving results",
             max_workers=4
         )
+
+    def transfer_fused_to_prior(self) -> None:
+        for image_id in self.active_image_ids:
+            depth_data = self.get_depth_data(image_id)
+            depth_data['prior_depth_map'] = depth_data['fused_depth_map']
 
