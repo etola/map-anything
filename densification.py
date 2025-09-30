@@ -631,15 +631,6 @@ class DensificationProblem:
         intrinsics = depth_data['camera_intrinsics']  # 3x3
         return uvd_to_world_frame(uvd_map, intrinsics, pose)
 
-
-    class Point:
-        def __init__(self, X, color):
-            self.X = X
-            self.color = color
-            self.visible_partner_ids = []
-        def add_partner_id(self, partner_id):
-            self.visible_partner_ids.append(partner_id)
-
     def fuse_for_image(self, image_id: int):
         depth_data = self.get_depth_data(image_id)
         pts3d, valid_mask = depthmap_to_world_frame(depth_data['depth_map'], depth_data['camera_intrinsics'], depth_data['camera_pose'])
@@ -700,54 +691,6 @@ class DensificationProblem:
             progress_desc="Fusing for images",
             max_workers=4
         )
-
-
-
-    def deprecated_fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:
-        depth_data = self.get_depth_data(image_id)
-        depth_map = depth_data['depth_map']
-        if depth_map is None:
-            return
-
-        img_pts3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-
-        # Initialize accumulators for averaging
-        points_sum = np.zeros_like(img_pts3d, dtype=np.float64)  # Use float64 for precision
-        points_count = np.zeros((self.target_size, self.target_size), dtype=np.int32)
-        
-        # Add main image's 3D points where valid
-        points_sum[valid_mask] += img_pts3d[valid_mask]
-        points_count[valid_mask] += 1
-        
-        # Add partner 3D points where valid
-        for partner_id, partner_map in valid_partner_maps.items():
-            partner_points_3d = self.uvd_to_world_frame(partner_id, partner_map)
-            partner_valid_mask = partner_map[:, :, 2] > 0
-            
-            # Add partner points where they are valid
-            points_sum[partner_valid_mask] += partner_points_3d[partner_valid_mask]
-            points_count[partner_valid_mask] += 1
-        
-        # Compute average 3D points (avoid division by zero)
-        fused_points_3d = np.zeros_like(img_pts3d, dtype=np.float32)
-        has_points_mask = points_count > self.fusion_min_consistency_count
-        fused_points_3d[has_points_mask] = (points_sum[has_points_mask] / points_count[has_points_mask, None]).astype(np.float32)
-        
-        # Convert fused 3D points back to depth map for the main image
-        # Extract valid 3D points for compute_depthmap (expects Nx3, not HxWx3)
-        valid_fused_mask = np.any(fused_points_3d != 0, axis=2)
-        if np.any(valid_fused_mask):
-            valid_fused_points = fused_points_3d[valid_fused_mask]
-            fused_depth_map = compute_depthmap(
-                valid_fused_points, 
-                depth_data['camera_intrinsics'], 
-                depth_data['camera_pose'], 
-                self.target_size
-            )
-        else:
-            fused_depth_map = np.zeros((self.target_size, self.target_size), dtype=np.float32)
-            
-        depth_data['fused_depth_map'] = fused_depth_map
 
     def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
         """
@@ -852,7 +795,6 @@ class DensificationProblem:
         consistency_map[valid_original_y, valid_original_x, 2] = consistent_depths
         
         return consistency_map
-
 
     def _save_single_result(self, image_id: int, tag: str = "") -> None:
         """Save all results for a single image."""
