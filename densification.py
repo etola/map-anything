@@ -202,7 +202,6 @@ class DensificationProblem:
         self.fusion_parallax_sample_size = 50
         self.fusion_consistency_threshold = 0.05
         self.fusion_min_consistency_count = 3
-        self.fusion_run_flag = False
 
 
     def clear(self) -> None:
@@ -616,35 +615,6 @@ class DensificationProblem:
         valid_partners = [pid for pid in similar_image_ids if pid in self.active_image_ids]
         return valid_partners[:max_partners]
 
-    def compute_consistency_image(self, image_id: int):
-        depth_data = self.get_depth_data(image_id)
-        depth_map = depth_data['depth_map']
-        if depth_map is None:
-            return
-
-        partner_image_ids = depth_data['partner_image_ids']
-        # print(f"Computing consistency for image {image_id}: Partner images: {partner_image_ids}")
-
-        # Early termination if no partners found
-        if len(partner_image_ids) == 0:
-            depth_data['consistency_map'] = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
-            return
-
-        consistency_map = np.zeros((depth_data['target_size'], depth_data['target_size']), dtype=np.float32)
-        
-        points_3d, valid_mask = depthmap_to_world_frame(depth_map, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-
-        valid_partner_maps = {}
-        for i, partner_id in enumerate(partner_image_ids):
-            partner_map = self.compute_consistency_map_depths(points_3d, valid_mask, partner_id)
-            valid_partner_maps[partner_id] = partner_map
-            consistency_map += (partner_map[:, :, 2] > 0).astype(np.float32)
-        
-        if self.fusion_run_flag:
-            self.fuse_depth_maps(image_id, valid_partner_maps)
-
-        depth_data['consistency_map'] = consistency_map
-
     def uvd_to_world_frame(self, image_id: int, uvd_map: np.ndarray) -> np.ndarray:
         """
         Convert uvd map to world frame.
@@ -730,6 +700,7 @@ class DensificationProblem:
             progress_desc="Fusing for images",
             max_workers=4
         )
+
 
 
     def deprecated_fuse_depth_maps(self, image_id: int, valid_partner_maps: dict) -> None:
@@ -882,14 +853,6 @@ class DensificationProblem:
         
         return consistency_map
 
-    def compute_consistency(self, run_fusion: bool=False) -> None:
-        self.fusion_run_flag = run_fusion
-        self.parallel_executor.run_in_parallel_no_return(
-            self.compute_consistency_image,
-            self.active_image_ids,
-            progress_desc="Computing consistency",
-            max_workers=4  # Reduce workers to avoid CPU thrashing
-        )
 
     def _save_single_result(self, image_id: int, tag: str = "") -> None:
         """Save all results for a single image."""
