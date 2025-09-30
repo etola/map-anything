@@ -244,7 +244,7 @@ def main():
     # densification_problem.save_results()
 
     densification_problem.apply_fusion()
-    # densification_problem.save_results()
+    densification_problem.save_results()
 
 
 

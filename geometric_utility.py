@@ -215,7 +215,7 @@ def colorize_heatmap(data_map, colormap='plasma', data_range=None, save_path=Non
     valid_mask = data_map > 0
 
     # Create normalized data map
-    normalized_data = np.zeros_like(data_map)
+    normalized_data = np.zeros_like(data_map, dtype=np.float32)
 
     if np.any(valid_mask):
         if data_range is not None:
@@ -224,7 +224,7 @@ def colorize_heatmap(data_map, colormap='plasma', data_range=None, save_path=Non
             min_value = np.min(data_map[valid_mask])
             max_value = np.max(data_map[valid_mask])
         if max_value > min_value:
-            normalized_data[valid_mask] = np.clip((data_map[valid_mask] - min_value) / (max_value - min_value), 0, 1)
+            normalized_data[valid_mask] = np.clip((data_map[valid_mask].astype(np.float32) - min_value) / (max_value - min_value), 0, 1)
         else:
             normalized_data[valid_mask] = 1.0
     
