@@ -691,19 +691,31 @@ class DensificationProblem:
             max_workers=4
         )
 
-    def export_fused_point_cloud(self, stepping: int = 1, file_name: str = ""):
+    def export_fused_point_cloud(self, stepping: int = 1, file_name: str = "fused.ply", use_parallel: bool = True):
 
         print(f"Exporting fused point cloud with stepping {stepping} and file name {file_name}")
 
+        if use_parallel:
+            return self._export_fused_point_cloud_parallel(stepping, file_name)
+        else:
+            return self._export_fused_point_cloud_sequential(stepping, file_name)
+    
+    def _export_fused_point_cloud_sequential(self, stepping: int = 1, file_name: str = "fused.ply"):
         pts_list = []
         colors_list = []
 
+        # Initialize exported masks
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
             depth_data['exported_mask'] = np.zeros((self.target_size, self.target_size), dtype=bool)
 
-        for image_id in self.active_image_ids:
+        # Create stepping mask once if needed (vectorized)
+        stepping_mask = None
+        if stepping > 1:
+            stepping_mask = np.zeros((self.target_size, self.target_size), dtype=bool)
+            stepping_mask[::stepping, ::stepping] = True
 
+        for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
             if depth_data['fused_depth_map'] is not None:
                 dmap = depth_data['fused_depth_map']
@@ -711,47 +723,124 @@ class DensificationProblem:
                     continue
 
                 exported_mask = depth_data['exported_mask']
-
                 image_pts3d, valid_mask = depthmap_to_world_frame(dmap, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-                # mark stepping pixels as invalid
-
-                # invalidate pixels that have already been exported
+                
+                # Remove already exported points
                 valid_mask &= ~exported_mask
 
-                # mark points that have been exported to partner images
+                # Mark points that have been exported to partner images (before applying stepping)
                 for partner_id in depth_data['partner_image_ids']:
                     partner_data = self.get_depth_data(partner_id)
                     uvd = self.compute_consistency_map_depths(image_pts3d, valid_mask, partner_id)
-                    uv = uvd[ uvd[:,:,2] > 0, :2 ]
-                    if len(uv) == 0:
-                        continue
-                    uv = uv.astype(int)
-                    partner_data['exported_mask'][uv[:, 1], uv[:, 0]] = True
+                    uv = uvd[uvd[:,:,2] > 0, :2]
+                    if len(uv) > 0:
+                        uv = uv.astype(int)
+                        partner_data['exported_mask'][uv[:, 1], uv[:, 0]] = True
 
-                if stepping > 1:
-                    stepping_mask = np.zeros_like(valid_mask, dtype=bool)
-                    stepping_mask[::stepping, ::stepping] = True
-                    valid_mask = valid_mask & stepping_mask
+                # Now apply stepping mask to choose which points to export from this image
+                if stepping_mask is not None:
+                    valid_mask &= stepping_mask
 
+                # Extract points and colors
                 pts3d = image_pts3d[valid_mask]
-                current_colors = np.ones((len(pts3d), 3), dtype=np.float32) * 0.5  # Gray color
+                if len(pts3d) > 0:
+                    current_colors = np.ones((len(pts3d), 3), dtype=np.float32) * 0.5  # Gray color
+                    if depth_data['scaled_image'] is not None:
+                        simg_array = np.array(depth_data['scaled_image'], dtype=np.float32) / 255.0
+                        current_colors = simg_array[valid_mask]
+                    
+                    pts_list.append(pts3d)
+                    colors_list.append(current_colors)
+
+        # Save results
+        pts = np.vstack(pts_list)
+        colors = np.vstack(colors_list)
+        print(f"Exported {len(pts)} points to {file_name}")
+        save_point_cloud(pts, colors, os.path.join(self.cloud_folder, file_name)) 
+           
+    def _export_fused_point_cloud_parallel(self, stepping: int = 1, file_name: str = "fused.ply"):
+        from threading import Lock
+        
+        # Initialize exported masks
+        for image_id in self.active_image_ids:
+            depth_data = self.get_depth_data(image_id)
+            depth_data['exported_mask'] = np.zeros((self.target_size, self.target_size), dtype=bool)
+        
+        # Thread-safe data collection
+        pts_list = []
+        colors_list = []
+        data_lock = Lock()
+        mask_locks = {img_id: Lock() for img_id in self.active_image_ids}
+        
+        # Create stepping mask once if needed (vectorized)
+        stepping_mask = None
+        if stepping > 1:
+            stepping_mask = np.zeros((self.target_size, self.target_size), dtype=bool)
+            stepping_mask[::stepping, ::stepping] = True
+        
+        def process_image(image_id: int):
+            """Process a single image in parallel"""
+            depth_data = self.get_depth_data(image_id)
+            if depth_data['fused_depth_map'] is None:
+                return None
+                
+            dmap = depth_data['fused_depth_map']
+            if dmap is None:
+                return None
+                
+            # Get exported mask with lock
+            with mask_locks[image_id]:
+                exported_mask = depth_data['exported_mask'].copy()
+                
+            image_pts3d, valid_mask = depthmap_to_world_frame(dmap, depth_data['camera_intrinsics'], depth_data['camera_pose'])
+            
+            # Remove already exported points
+            valid_mask &= ~exported_mask
+                
+            # Process partner images with locks to avoid race conditions (before applying stepping)
+            for partner_id in depth_data['partner_image_ids']:
+                if partner_id in mask_locks:  # Only process if partner is active
+                    partner_data = self.get_depth_data(partner_id)
+                    uvd = self.compute_consistency_map_depths(image_pts3d, valid_mask, partner_id)
+                    uv = uvd[uvd[:,:,2] > 0, :2]
+                    if len(uv) > 0:
+                        uv = uv.astype(int)
+                        # Thread-safe update of partner's exported_mask
+                        with mask_locks[partner_id]:
+                            partner_data['exported_mask'][uv[:, 1], uv[:, 0]] = True
+
+            # Now apply stepping mask to choose which points to export from this image
+            if stepping_mask is not None:
+                valid_mask &= stepping_mask
+                            
+            # Extract points and colors
+            pts3d = image_pts3d[valid_mask]
+            if len(pts3d) > 0:
+                current_colors = np.ones((len(pts3d), 3), dtype=np.float32) * 0.5
                 if depth_data['scaled_image'] is not None:
-                    simg_array = np.array(depth_data['scaled_image'], dtype=np.float32) / 255.0  # Shape: (518, 518, 3)
-                    current_colors = simg_array[valid_mask]  # Shape: (N_valid_pixels, 3)
+                    simg_array = np.array(depth_data['scaled_image'], dtype=np.float32) / 255.0
+                    current_colors = simg_array[valid_mask]
+                
+                # Thread-safe collection
+                with data_lock:
+                    pts_list.append(pts3d)
+                    colors_list.append(current_colors)
+            
+            return len(pts3d) if len(pts3d) > 0 else 0
+        
+        # Run in parallel
+        self.parallel_executor.run_in_parallel_no_return(
+            process_image,
+            self.active_image_ids,
+            progress_desc="Exporting point cloud",
+            max_workers=4
+        )
 
-                pts_list.append(pts3d)
-                colors_list.append(current_colors)
+        pts = np.vstack(pts_list)
+        colors = np.vstack(colors_list)
+        print(f"Exported {len(pts)} points to {file_name}")
+        save_point_cloud(pts, colors, os.path.join(self.cloud_folder, file_name))
 
-        if pts_list:
-            pts = np.vstack(pts_list)
-            colors = np.vstack(colors_list)
-            if file_name:
-                cloud_file = os.path.join(self.cloud_folder, file_name)
-            else:
-                cloud_file = os.path.join(self.cloud_folder, "fused.ply")
-            save_point_cloud(pts, colors, cloud_file)
-        else:
-            print("No points to export")
 
     def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
         """

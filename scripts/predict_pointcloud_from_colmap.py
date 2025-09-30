@@ -245,7 +245,7 @@ def main():
 
     densification_problem.apply_fusion()
 
-    densification_problem.export_fused_point_cloud(stepping=2, file_name="fused_stepping.ply")
+    densification_problem.export_fused_point_cloud(stepping=2, file_name="fused_stepping2.ply")
 
     # densification_problem.save_results()
 
