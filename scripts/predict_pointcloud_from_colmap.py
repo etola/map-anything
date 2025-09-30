@@ -116,7 +116,7 @@ def parse_args():
         "-R", "--reference_reconstruction",
         type=str,
         default=None,
-        help="Path to reference COLMAP reconstruction for prior depth information (default: None)",
+        help="Path to reference lidar fused cloud in COLMAP reconstruction format for prior depth information (default: None)",
     )
     parser.add_argument(
         "-v", "--verbose",
