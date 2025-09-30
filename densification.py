@@ -330,6 +330,14 @@ class DensificationProblem:
             progress_desc="Loading and Scaling Images"
         )
 
+        self.parallel_executor.run_in_parallel_no_return(
+            self.save_depth_data,
+            self.active_image_ids,
+            progress_desc="Saving initialized depth data",
+            max_workers=4
+        )
+
+
 
     def initialize_prior_depth_data_from_reference(self, image_id: int) -> None:
         if self.reference_reconstruction is None:
