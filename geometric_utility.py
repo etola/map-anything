@@ -56,21 +56,22 @@ def uvd_to_world_frame(uvd_map: np.ndarray, intrinsics: np.ndarray, pose: np.nda
     return xyz_map
 
 
-def compute_depthmap(points_3d, intrinsics, cam_from_world, target_size):
+def compute_depthmap(points_3d, intrinsics, cam_from_world, target_w, target_h):
     """
     Project 3D points to depth map in camera coordinate system.
     
     Args:
         points_3d: (N, 3) array of 3D world coordinates
-        intrinsics: (3, 3) intrinsics matrix for a target_size x target_size image
+        intrinsics: (3, 3) intrinsics matrix for a target_h x target_w image
         cam_from_world (4, 4): camera pose: transformation matrix that maps world coordinates to camera coordinates when multiplied
-        target_size: target image size for depth map
+        target_w: target image width for depth map
+        target_h: target image height for depth map
         
     Returns:
-        depth_map: (target_size, target_size) numpy array with depth values
+        depth_map: (target_h, target_w) numpy array with depth values
     """
     if len(points_3d) == 0:
-        return np.zeros((target_size, target_size), dtype=np.float32)
+        return np.zeros((target_h, target_w), dtype=np.float32)
     
     # Convert 3D points to homogeneous coordinates
     points_3d_homo = np.hstack([points_3d, np.ones((len(points_3d), 1))])
@@ -84,7 +85,7 @@ def compute_depthmap(points_3d, intrinsics, cam_from_world, target_size):
     # Filter points behind camera
     valid_mask = depths > 0
     if not np.any(valid_mask):
-        return np.zeros((target_size, target_size), dtype=np.float32)
+        return np.zeros((target_h, target_w), dtype=np.float32)
     
     cam_coords = cam_coords[valid_mask]
     depths = depths[valid_mask]
@@ -99,11 +100,11 @@ def compute_depthmap(points_3d, intrinsics, cam_from_world, target_size):
     
     # Filter points within image bounds
     valid_pixels = (
-        (pixel_x >= 0) & (pixel_x < target_size) &
-        (pixel_y >= 0) & (pixel_y < target_size)
+        (pixel_x >= 0) & (pixel_x < target_w) &
+        (pixel_y >= 0) & (pixel_y < target_h)
     )
     
-    depth_map = np.zeros((target_size, target_size), dtype=np.float32)
+    depth_map = np.zeros((target_h, target_w), dtype=np.float32)
     
     if np.any(valid_pixels):
         pixel_x = pixel_x[valid_pixels]

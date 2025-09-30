@@ -1129,7 +1129,7 @@ def build_image_id_mapping(source_reconstruction, target_reconstruction, source_
         source_to_target_image_id_mapping[img_id] = find_exact_image_match(source_reconstruction, target_reconstruction, img_id)
     return source_to_target_image_id_mapping
 
-def compute_image_depthmap(reconstruction, image_id, intrinsics, cam_from_world, target_size, min_track_length=1, verbose=False):
+def compute_image_depthmap(reconstruction, image_id, intrinsics, cam_from_world, target_w, target_h, min_track_length=1, verbose=False):
     """
     Compute prior depth map from reference COLMAP reconstruction for a specific image.
     This depth map will be provided to the MapAnything model as prior information via the 'depth_z' key.
@@ -1137,13 +1137,14 @@ def compute_image_depthmap(reconstruction, image_id, intrinsics, cam_from_world,
     Args:
         reference_reconstruction: ColmapReconstruction object containing prior 3D points
         image_id: COLMAP image ID to compute depth map for
-        intrinsics: (3, 3) intrinsics matrix for target_size x target_size image
+        intrinsics: (3, 3) intrinsics matrix for target_h x target_w image
         cam_from_world: (4, 4) camera pose matrix (ie when you multiply a 3D world point by this matrix, you get the 3D point in the camera frame)
-        target_size: target image size for depth map
+        target_w: target image width for depth map
+        target_h: target image height for depth map
         min_track_length: minimum track length for 3D points to include        
     Returns:
         tuple: (prior_depth, depth_range) where:
-            - prior_depth: (target_size, target_size) numpy array with depth values, or None if no points
+            - prior_depth: (target_h, target_w) numpy array with depth values, or None if no points
             - depth_range: (min_depth, max_depth) tuple for consistent scaling, or None if no valid depths
     """
     try:
@@ -1159,7 +1160,7 @@ def compute_image_depthmap(reconstruction, image_id, intrinsics, cam_from_world,
             print(f"Computing prior depth from {len(points_3d)} 3D points for image {image_id}")
         
         # Project 3D points to a depth map in camera frame
-        depth_map = compute_depthmap(points_3d, intrinsics, cam_from_world, target_size)
+        depth_map = compute_depthmap(points_3d, intrinsics, cam_from_world, target_w, target_h)
 
         # Check if depth map has valid depths
         valid_depths = np.sum(depth_map > 0)

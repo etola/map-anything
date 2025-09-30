@@ -11,8 +11,8 @@ import open3d as o3d
 import glob
 from typing import List
 
+from threedn_depth_data import ThreednDepthData
 from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap, uvd_to_world_frame
-
 
 
 
@@ -138,25 +138,28 @@ class DensificationProblem:
     for each image, in depth_data we store:
         'image_id'              : image_id,
         'image_name'            : image_name,
-        'scaled_image'          : image_scaled in target_size x target_size,
-        'depth_map'             : depth_map in target_size x target_size or None,
-        'confidence_map'        : confidence_map in target_size x target_size or None,
-        'point_mask'            : point mask in target_size x target_size or None, (stores with points should be considered)
-        'fused_depth_map'       : fused depth map in target_size x target_size or None,
-        'prior_depth_map'       : prior depth map in target_size x target_size or None,
-        'consistency_map'       : consistency map of the estimated depth map with the partner images map in target_size x target_size or None,
+        'scaled_image'          : image_scaled in target_h x target_w,
+        'depth_map'             : depth_map in target_h x target_w or None,
+        'confidence_map'        : confidence_map in target_h x target_w or None,
+        'point_mask'            : point mask in target_h x target_w or None, (stores with points should be considered)
+        'views'                 : views map dictionary per partner image in target_h x target_w or None, (stores the valid points for each pixel in the partner image)
+        'fused_depth_map'       : fused depth map in target_h x target_w or None,
+        'prior_depth_map'       : prior depth map in target_h x target_w or None,
+        'consistency_map'       : consistency map of the estimated depth map with the partner images map in target_h x target_w or None,
         'depth_range'           : (min_depth, max_depth) tuple for consistent scaling, or None if no valid depths,
         'confidence_range'      : (min_confidence, max_confidence) tuple for consistent scaling, or None if no valid confidences,
-        'camera_intrinsics'     : K_scaled,  # scaled intrinsics for target_size x target_size image
+        'camera_intrinsics'     : K_scaled,  # scaled intrinsics for target_h x target_w image
         'camera_pose'           : pose_4x4,        # Use 4x4 cam_from_world pose matrix for projecting world points to camera frame
         'original_intrinsics'   : K,       # original intrinsics for original image,
-        'target_size'           : target_size
+        'h'                     : height of the maps,
+        'w'                     : width of the maps
 
     """
     
     def __init__(self, 
                  scene_folder: str,
-                 target_size: int,
+                 target_h: int,
+                 target_w: int,
                  output_folder: str
                  ) -> None:
 
@@ -166,7 +169,8 @@ class DensificationProblem:
         Args:
             reconstruction: COLMAP reconstruction object
             scene_folder: Path to scene folder containing images
-            target_size: Target image size
+            target_h: Target image height
+            target_w: Target image width
             output_folder: Path to output folder
         """
         self.scene_folder = scene_folder
@@ -181,7 +185,8 @@ class DensificationProblem:
         self.reconstruction = ColmapReconstruction(sparse_dir)
 
         self.reference_reconstruction = None
-        self.target_size = target_size
+        self.target_h = target_h
+        self.target_w = target_w
 
         self.output_folder = os.path.join(self.scene_folder, output_folder)
         os.makedirs(self.output_folder, exist_ok=True)
@@ -204,7 +209,6 @@ class DensificationProblem:
         self.fusion_consistency_threshold = 0.05
         self.fusion_min_consistency_count = 3
 
-
     def clear(self) -> None:
         self.scene_depth_data = {}
         self.active_image_ids = self.reconstruction.get_all_image_ids()
@@ -222,8 +226,8 @@ class DensificationProblem:
         K = self.reconstruction.get_camera_calibration_matrix(image_id)
         
         # Scale intrinsics for resized image
-        scale_x = self.target_size / original_width
-        scale_y = self.target_size / original_height
+        scale_x = self.target_w / original_width
+        scale_y = self.target_h / original_height
         K_scaled = K.copy()
         K_scaled[0, :] *= scale_x  # Scale fx and cx
         K_scaled[1, :] *= scale_y  # Scale fy and cy
@@ -240,6 +244,7 @@ class DensificationProblem:
             'depth_map': None,
             'confidence_map': None,
             'point_mask': None,
+            'views': None,
             'prior_depth_map': None,
             'fused_depth_map': None,
             'consistency_map': None,
@@ -248,11 +253,91 @@ class DensificationProblem:
             'camera_intrinsics': K_scaled,  # Use scaled intrinsics
             'camera_pose': pose_4x4,        # Use 4x4 cam_from_world pose matrix
             'original_intrinsics': K,       # Also save original intrinsics for reference,
-            'target_size': self.target_size,
+            'target_w': self.target_w,
+            'target_h': self.target_h,
             'partner_image_ids': self.find_similar_images_for_image(image_id, self.fusion_max_partners)
         }
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
+
+    def export_threedn_depth_data(self, image_id: int) -> None:
+        depth_data = self.get_depth_data(image_id)
+        threedn_depth_data = ThreednDepthData()
+
+        dmap = depth_data['depth_map']
+
+        threedn_depth_data.image_name = depth_data['image_name']
+        threedn_depth_data.image_size = (depth_data['target_w'], depth_data['target_h'])
+        threedn_depth_data.depth_size = (depth_data['target_w'], depth_data['target_h'])
+        threedn_depth_data.depth_range = np.min(dmap[dmap>0]), np.max(dmap[dmap>0])
+
+        cam_from_world = depth_data['camera_pose']
+        R = cam_from_world[:3, :3]
+        t = cam_from_world[:3, 3]
+        C = -R.T @ t
+
+        threedn_depth_data.K = depth_data['camera_intrinsics']
+        threedn_depth_data.R = R
+        threedn_depth_data.C = C
+        threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH | ThreednDepthData.HAS_CONF | ThreednDepthData.HAS_VIEWS
+        threedn_depth_data.depthMap = depth_data['depth_map'].flatten().tolist()
+        threedn_depth_data.conf = depth_data['confidence_map'].flatten().tolist()
+
+        view1 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
+        view2 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
+        view3 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
+        view4 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
+
+        partner_ids = depth_data['partner_image_ids'][:4]
+        threedn_depth_data.neighbors = partner_ids
+        if len(partner_ids) > 0:
+            view1[depth_data['views'][partner_ids[0]] > 0] = 0
+        if len(partner_ids) > 1:
+            view2[depth_data['views'][partner_ids[1]] > 0] = 1
+        if len(partner_ids) > 2:
+            view3[depth_data['views'][partner_ids[2]] > 0] = 2
+        if len(partner_ids) > 3:
+            view4[depth_data['views'][partner_ids[3]] > 0] = 3
+
+        threedn_depth_data.views = view1.flatten().tolist() + view2.flatten().tolist() + view3.flatten().tolist() + view4.flatten().tolist()
+
+        threedn_depth_data.hsize = threedn_depth_data.headersize()
+
+        threedn_depth_data.save(os.path.join(self.dmap_folder, f"{image_id:06d}.dmap"))
+
+    # def import_threedn_depth_data(self, image_id: int, dmap_path: str) -> None:
+    #     threedn_depth_data = ThreednDepthData()
+    #     threedn_depth_data.load(dmap_path)
+
+    #     depth_data = self.get_depth_data(image_id)
+
+    #     h = threedn_depth_data.depth_size[0]
+    #     w = threedn_depth_data.depth_size[1]
+
+    #     depth_data['depth_map'] = np.array(threedn_depth_data.depthMap).reshape(h, w)
+    #     depth_data['image_name'] = threedn_depth_data.image_name
+    #     depth_data['depth_range'] = threedn_depth_data.depth_range
+    #     depth_data['camera_intrinsics'] = threedn_depth_data.K
+    #     R = threedn_depth_data.R
+    #     C = threedn_depth_data.C
+
+    #     pose_4x4 = np.eye(4)
+    #     pose_4x4[:3, :3] = R
+    #     pose_4x4[:3, 3] = -R @ C
+    #     depth_data['camera_pose'] = pose_4x4
+    #     depth_data['partner_image_ids'] = threedn_depth_data.neighbors
+
+    #     if threedn_depth_data.flags & ThreednDepthData.HAS_CONF:
+    #         depth_data['confidence_map'] = np.array(threedn_depth_data.conf).reshape(h, w)
+    #         depth_data['confidence_range'] = (np.min(depth_data['confidence_map']), np.max(depth_data['confidence_map']))
+    #     if threedn_depth_data.flags & ThreednDepthData.HAS_VIEWS:
+    #         views = np.array(threedn_depth_data.views)
+
+
+        # depth_data['confidence_map'] = np.array(threedn_depth_data.conf).reshape(h, w)
+        # depth_data['views'] = np.array(threedn_depth_data.views).reshape(h, w)
+
+
 
 
     def get_depth_data(self, image_id: int) -> dict:
@@ -272,7 +357,8 @@ class DensificationProblem:
                 depth_data[key] = data[key].item()
             else:
                 depth_data[key] = data[key]
-        assert self.target_size == depth_data['target_size']
+        assert self.target_w == depth_data['target_w']
+        assert self.target_h == depth_data['target_h']
         assert self.reconstruction.has_image(image_id)
         return depth_data
 
@@ -312,13 +398,13 @@ class DensificationProblem:
 
         for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
+            self.initialize_prior_depth_data_from_reference(img_id)
 
-        # Option 2: Reduced workers (recommended)
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_prior_depth_data_from_reference,
             self.active_image_ids,
             progress_desc="Initializing Prior Depth Data from Reference",
-            max_workers=2  # Reduce workers to avoid overwhelming system
+            max_workers=4  # Reduce workers to avoid overwhelming system
         )
         
         self.parallel_executor.run_in_parallel_no_return(
@@ -336,7 +422,7 @@ class DensificationProblem:
         assert ref_image_id is not None, f"No target image id found for image {image_id}"
         
         # This is the expensive operation - 3D point projection
-        prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_size, min_track_length=1)
+        prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_w, self.target_h, min_track_length=1)
         
         if prior_depth_map is None:
             print(f"Warning: No prior depth map found for image {image_id}")
@@ -346,8 +432,9 @@ class DensificationProblem:
     def initialize_scaled_image(self, image_id: int) -> None:
         depth_data = self.get_depth_data(image_id)
         if depth_data['scaled_image'] is not None:
-            target_size = depth_data['target_size']
-            assert depth_data['scaled_image'].shape == (target_size, target_size, 3), f"Scaled image shape {depth_data['scaled_image'].shape} does not match target size {target_size}"
+            target_w = depth_data['target_w']
+            target_h = depth_data['target_h']
+            assert depth_data['scaled_image'].shape == (target_h, target_w, 3), f"Scaled image shape {depth_data['scaled_image'].shape} does not match target size {target_h}x{target_w}"
             return
         image_path = os.path.join(self.scene_folder, "images", depth_data['image_name'])
         assert os.path.exists(image_path), f"Image {image_id}: {image_path} does not exist"
@@ -357,7 +444,7 @@ class DensificationProblem:
             img = Image.alpha_composite(background, img)
         img = img.convert("RGB")
         # Convert PIL Image to numpy array for consistent indexing
-        depth_data['scaled_image'] = np.array(img.resize((depth_data['target_size'], depth_data['target_size']), Image.Resampling.BICUBIC))
+        depth_data['scaled_image'] = np.array(img.resize((depth_data['target_h'], depth_data['target_w']), Image.Resampling.BICUBIC))
 
     def update_depth_data(self, image_id: int, depth_map: np.ndarray, confidence_map: np.ndarray) -> None:
         depth_data = self.get_depth_data(image_id)
@@ -379,9 +466,10 @@ class DensificationProblem:
         else:
             depth_data['point_mask'] &= (depth_map > 0).astype(bool)
 
-        target_size = depth_data['target_size']
-        assert depth_map.shape == (target_size, target_size), f"Depth map shape {depth_map.shape} does not match target size {target_size}"
-        assert confidence_map.shape == (target_size, target_size), f"Confidence map shape {confidence_map.shape} does not match target size {target_size}"
+        target_w = depth_data['target_w']
+        target_h = depth_data['target_h']
+        assert depth_map.shape == (target_h, target_w), f"Depth map shape {depth_map.shape} does not match target size {target_h}x{target_w}"
+        assert confidence_map.shape == (target_h, target_w), f"Confidence map shape {confidence_map.shape} does not match target size {target_h}x{target_w}"
 
     def save_depth_data(self, image_id: int) -> None:
         depth_data = self.get_depth_data(image_id)
@@ -583,7 +671,7 @@ class DensificationProblem:
             Image.fromarray(rgb).save(os.path.join(self.depth_data_folder, f"prior_depth_{image_id:06d}.png"))
 
         elif what_to_save == "all":
-            empty = np.zeros((depth_data['target_size'], depth_data['target_size'], 3), dtype=np.uint8)
+            empty = np.zeros((depth_data['target_h'], depth_data['target_w'], 3), dtype=np.uint8)
             depth_rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
             conf_rgb  = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
             prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
@@ -591,9 +679,9 @@ class DensificationProblem:
             consistency_rgb = colorize_heatmap(depth_data['consistency_map'], data_range=(0, self.fusion_max_partners-1)) if depth_data['consistency_map'] is not None else empty
 
             # generate a legend image
-            legend_image = np.zeros((self.target_size, 50), dtype=np.float32)
+            legend_image = np.zeros((self.target_h, 50), dtype=np.float32)
             for i in range(self.fusion_max_partners):
-                legend_image[i*self.target_size//self.fusion_max_partners:(i+1)*self.target_size//self.fusion_max_partners, :] = i
+                legend_image[i*self.target_h//self.fusion_max_partners:(i+1)*self.target_h//self.fusion_max_partners, :] = i
             legend_rgb = colorize_heatmap(legend_image, data_range=(0, self.fusion_max_partners-1))
 
             combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, fusion_rgb, conf_rgb, consistency_rgb, legend_rgb], axis=1)
@@ -649,9 +737,12 @@ class DensificationProblem:
         partner_image_ids = depth_data['partner_image_ids']
         partner_uvds = {}
 
+        depth_data['views'] = {}
+
         for partner_id in partner_image_ids:
             partner_data = self.get_depth_data(partner_id)
             partner_uvd = self.compute_consistency_map_depths(pts3d, valid_mask, partner_id)
+            depth_data['views'][partner_id] = (partner_uvd[:,:,2] > 0).astype(np.uint8)
             partner_valid_mask = valid_mask & (partner_uvd[:,:,2] > 0).astype(np.uint8)
             partner_uvd[partner_valid_mask,2] = 0
             partner_uvds[partner_id] = partner_uvd
@@ -668,24 +759,27 @@ class DensificationProblem:
         # average point by the number of accumulated valid masks per pixel
         fused_pts3d = np.zeros_like(pts3d, dtype=np.float32)
         fused_pts3d[consistency_mask] = accumulated_pts3d[consistency_mask] / accumulated_valid_mask[consistency_mask][:, None]
-        fused_dmap = compute_depthmap(fused_pts3d[consistency_mask], depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_size)
+        fused_dmap = compute_depthmap(fused_pts3d[consistency_mask], depth_data['camera_intrinsics'], depth_data['camera_pose'], target_w=depth_data['target_w'], target_h=depth_data['target_h'])
 
         depth_data['fused_depth_map'] = fused_dmap
 
 
     def apply_fusion(self):
 
-        for image_id in self.active_image_ids:
-            depth_data = self.get_depth_data(image_id)
-            # filter point mask by confidence here if you want
-            # depth_data['point_mask'] &= (depth_data['confidence_map'] > 0).astype(bool)
+        # for image_id in self.active_image_ids:
+        #     depth_data = self.get_depth_data(image_id)
+        #     # filter point mask by confidence here if you want
+        #     # depth_data['point_mask'] &= (depth_data['confidence_map'] > 0).astype(bool)
 
-        self.parallel_executor.run_in_parallel_no_return(
-            self.fuse_for_image,
-            self.active_image_ids,
-            progress_desc="Fusing depth maps",
-            max_workers=4
-        )
+        for image_id in self.active_image_ids:
+            self.fuse_for_image(image_id)
+
+        # self.parallel_executor.run_in_parallel_no_return(
+        #     self.fuse_for_image,
+        #     self.active_image_ids,
+        #     progress_desc="Fusing depth maps",
+        #     max_workers=4
+        # )
 
     def export_fused_point_cloud(self, stepping: int = 1, file_name: str = "fused.ply", use_parallel: bool = True):
 
@@ -703,12 +797,12 @@ class DensificationProblem:
         # Initialize exported masks
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
-            depth_data['exported_mask'] = np.zeros((self.target_size, self.target_size), dtype=bool)
+            depth_data['exported_mask'] = np.zeros_like(depth_data['depth_map'], dtype=bool)
 
         # Create stepping mask once if needed (vectorized)
         stepping_mask = None
         if stepping > 1:
-            stepping_mask = np.zeros((self.target_size, self.target_size), dtype=bool)
+            stepping_mask = np.zeros_like(depth_data['depth_map'], dtype=bool)
             stepping_mask[::stepping, ::stepping] = True
 
         for image_id in self.active_image_ids:
@@ -760,7 +854,7 @@ class DensificationProblem:
         # Initialize exported masks
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
-            depth_data['exported_mask'] = np.zeros((self.target_size, self.target_size), dtype=bool)
+            depth_data['exported_mask'] = np.zeros_like(depth_data['depth_map'], dtype=bool)
         
         # Thread-safe data collection
         pts_list = []
@@ -771,7 +865,7 @@ class DensificationProblem:
         # Create stepping mask once if needed (vectorized)
         stepping_mask = None
         if stepping > 1:
-            stepping_mask = np.zeros((self.target_size, self.target_size), dtype=bool)
+            stepping_mask = np.zeros((self.target_h, self.target_w), dtype=bool)
             stepping_mask[::stepping, ::stepping] = True
         
         def process_image(image_id: int):
@@ -853,13 +947,13 @@ class DensificationProblem:
         partner_depth_data = self.get_depth_data(partner_id)
         partner_depth_map = partner_depth_data['depth_map']
         if partner_depth_map is None:
-            return np.zeros((self.target_size, self.target_size, 3), dtype=np.float32)
+            return np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
 
         partner_intrinsics = partner_depth_data['camera_intrinsics']
         partner_pose = partner_depth_data['camera_pose']  # cam_from_world for partner
         
         # Initialize consistency map (default to invalid [u, v, depth])
-        consistency_map = np.zeros((self.target_size, self.target_size, 3), dtype=np.float32)
+        consistency_map = np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
         
         # Extract valid 3D points and their original coordinates
         valid_points_3d = points_3d[valid_mask]  # Shape: (N, 3)
@@ -895,8 +989,8 @@ class DensificationProblem:
         
         # Filter points within image bounds
         in_bounds_mask = (
-            (partner_pixel_x >= 0) & (partner_pixel_x < self.target_size) &
-            (partner_pixel_y >= 0) & (partner_pixel_y < self.target_size)
+            (partner_pixel_x >= 0) & (partner_pixel_x < self.target_w) &
+            (partner_pixel_y >= 0) & (partner_pixel_y < self.target_h)
         )
         
         if not np.any(in_bounds_mask):

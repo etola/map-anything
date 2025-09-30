@@ -203,7 +203,7 @@ def main():
     # Set seed for reproducibility
     seed_everything(args.seed)
 
-    densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.output_folder)
+    densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.resolution, args.output_folder)
 
     if densification_problem.is_precomputed_depth_data_present():
         print("Precomputed depth data found, skipping initialization")
