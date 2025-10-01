@@ -303,7 +303,7 @@ class DensificationProblem:
 
         threedn_depth_data.hsize = threedn_depth_data.headersize()
 
-        threedn_depth_data.save(os.path.join(self.dmap_folder, f"{image_id:06d}.dmap"))
+        threedn_depth_data.save(os.path.join(self.output_folder, f"depth{image_id:04d}.dmap"))
 
     def export_dmaps(self, max_image_size: int = 800, max_workers: int = 4) -> None:
         self.parallel_executor.run_in_parallel_no_return(
