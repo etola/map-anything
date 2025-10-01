@@ -193,6 +193,20 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         
     del predictions
 
+def test_dmaps(workfolder):
+
+    from threedn_depth_data import ThreednDepthData
+
+    tdn_folder = os.path.join(workfolder, "workfolder")
+
+    dmap7 = ThreednDepthData()
+    dmap7.load(os.path.join(tdn_folder, "depth0007.dmap"))
+
+    print(dmap7.depthMap.shape)
+
+
+
+
 def main():
     """Main function."""
     args = parse_args()
@@ -242,30 +256,10 @@ def main():
                 torch.cuda.empty_cache()
 
         densification_problem.save_current_state()
+        densification_problem.export_dmaps(max_image_size=800, max_workers=4)
 
     densification_problem.apply_fusion()
     densification_problem.export_fused_point_cloud(file_name="fused.ply")
-
-    # print("Running second iteration")
-    # densification_problem.transfer_fused_to_prior()
-    # for batch_idx, batch_image_ids in enumerate(batches):
-    #     print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
-    #     with torch.no_grad():
-    #         run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
-    #         # Clear GPU memory
-    #         torch.cuda.empty_cache()
-
-    # densification_problem.apply_fusion()
-    # densification_problem.export_fused_point_cloud(file_name="fused_2.ply")
-
-    # print("Running third iteration")
-    # densification_problem.transfer_fused_to_prior()
-    # for batch_idx, batch_image_ids in enumerate(batches):
-    #     print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
-    #     with torch.no_grad():
-    #         run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
-    #         # Clear GPU memory
-    #         torch.cuda.empty_cache()
 
     # densification_problem.apply_fusion()
     # densification_problem.export_fused_point_cloud(file_name="fused_3.ply")

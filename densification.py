@@ -7,6 +7,8 @@ from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
+import cv2
+
 import open3d as o3d
 import glob
 from typing import List
@@ -142,7 +144,6 @@ class DensificationProblem:
         'depth_map'             : depth_map in target_h x target_w or None,
         'confidence_map'        : confidence_map in target_h x target_w or None,
         'point_mask'            : point mask in target_h x target_w or None, (stores with points should be considered)
-        'views'                 : views map dictionary per partner image in target_h x target_w or None, (stores the valid points for each pixel in the partner image)
         'fused_depth_map'       : fused depth map in target_h x target_w or None,
         'prior_depth_map'       : prior depth map in target_h x target_w or None,
         'consistency_map'       : consistency map of the estimated depth map with the partner images map in target_h x target_w or None,
@@ -190,11 +191,15 @@ class DensificationProblem:
 
         self.output_folder = os.path.join(self.scene_folder, output_folder)
         os.makedirs(self.output_folder, exist_ok=True)
+
         self.depth_data_folder = os.path.join(self.output_folder, "depth_data")
         os.makedirs(self.depth_data_folder, exist_ok=True)
 
         self.cloud_folder = os.path.join(self.output_folder, "point_clouds")
         os.makedirs(self.cloud_folder, exist_ok=True)
+
+        self.dmap_folder = os.path.join(self.output_folder, "dmaps")
+        os.makedirs(self.dmap_folder, exist_ok=True)
 
         self.scene_depth_data = {}        # stores all the depth data for each image
         self.active_image_ids = self.reconstruction.get_all_image_ids()
@@ -244,7 +249,6 @@ class DensificationProblem:
             'depth_map': None,
             'confidence_map': None,
             'point_mask': None,
-            'views': None,
             'prior_depth_map': None,
             'fused_depth_map': None,
             'consistency_map': None,
@@ -260,15 +264,26 @@ class DensificationProblem:
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
 
-    def export_threedn_depth_data(self, image_id: int) -> None:
+    def export_as_threedn_depth_data(self, image_id: int, max_image_size: int = 800) -> None:
         depth_data = self.get_depth_data(image_id)
         threedn_depth_data = ThreednDepthData()
 
-        dmap = depth_data['depth_map']
+        camera = self.reconstruction.get_image_camera(image_id)
+        export_width, export_height = camera.width, camera.height
+
+        if export_width > max_image_size or export_height > max_image_size:
+            scale = max_image_size / max(export_width, export_height)
+            export_width = int(export_width * scale)
+            export_height = int(export_height * scale)
+
+        print(f"Exporting dmap for image {image_id} with size {export_width}x{export_height}")
+
+        dmap = cv2.resize(depth_data['depth_map'], (export_width, export_height), cv2.INTER_LINEAR)
+        cmap = cv2.resize(depth_data['confidence_map'], (export_width, export_height), cv2.INTER_LINEAR)
 
         threedn_depth_data.image_name = depth_data['image_name']
-        threedn_depth_data.image_size = (depth_data['target_w'], depth_data['target_h'])
-        threedn_depth_data.depth_size = (depth_data['target_w'], depth_data['target_h'])
+        threedn_depth_data.image_size = (camera.width, camera.height)
+        threedn_depth_data.depth_size = (export_width, export_height)
         threedn_depth_data.depth_range = np.min(dmap[dmap>0]), np.max(dmap[dmap>0])
 
         cam_from_world = depth_data['camera_pose']
@@ -279,66 +294,24 @@ class DensificationProblem:
         threedn_depth_data.K = depth_data['camera_intrinsics']
         threedn_depth_data.R = R
         threedn_depth_data.C = C
-        threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH | ThreednDepthData.HAS_CONF | ThreednDepthData.HAS_VIEWS
-        threedn_depth_data.depthMap = depth_data['depth_map'].flatten().tolist()
-        threedn_depth_data.conf = depth_data['confidence_map'].flatten().tolist()
-
-        view1 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
-        view2 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
-        view3 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
-        view4 = np.ones((depth_data['target_h'], depth_data['target_w']), dtype=np.uint8) * 255
+        threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH | ThreednDepthData.HAS_CONF
+        threedn_depth_data.depthMap = dmap.flatten().tolist()
+        threedn_depth_data.conf = cmap.flatten().tolist()
 
         partner_ids = depth_data['partner_image_ids'][:4]
         threedn_depth_data.neighbors = partner_ids
-        if len(partner_ids) > 0:
-            view1[depth_data['views'][partner_ids[0]] > 0] = 0
-        if len(partner_ids) > 1:
-            view2[depth_data['views'][partner_ids[1]] > 0] = 1
-        if len(partner_ids) > 2:
-            view3[depth_data['views'][partner_ids[2]] > 0] = 2
-        if len(partner_ids) > 3:
-            view4[depth_data['views'][partner_ids[3]] > 0] = 3
-
-        threedn_depth_data.views = view1.flatten().tolist() + view2.flatten().tolist() + view3.flatten().tolist() + view4.flatten().tolist()
 
         threedn_depth_data.hsize = threedn_depth_data.headersize()
 
         threedn_depth_data.save(os.path.join(self.dmap_folder, f"{image_id:06d}.dmap"))
 
-    # def import_threedn_depth_data(self, image_id: int, dmap_path: str) -> None:
-    #     threedn_depth_data = ThreednDepthData()
-    #     threedn_depth_data.load(dmap_path)
-
-    #     depth_data = self.get_depth_data(image_id)
-
-    #     h = threedn_depth_data.depth_size[0]
-    #     w = threedn_depth_data.depth_size[1]
-
-    #     depth_data['depth_map'] = np.array(threedn_depth_data.depthMap).reshape(h, w)
-    #     depth_data['image_name'] = threedn_depth_data.image_name
-    #     depth_data['depth_range'] = threedn_depth_data.depth_range
-    #     depth_data['camera_intrinsics'] = threedn_depth_data.K
-    #     R = threedn_depth_data.R
-    #     C = threedn_depth_data.C
-
-    #     pose_4x4 = np.eye(4)
-    #     pose_4x4[:3, :3] = R
-    #     pose_4x4[:3, 3] = -R @ C
-    #     depth_data['camera_pose'] = pose_4x4
-    #     depth_data['partner_image_ids'] = threedn_depth_data.neighbors
-
-    #     if threedn_depth_data.flags & ThreednDepthData.HAS_CONF:
-    #         depth_data['confidence_map'] = np.array(threedn_depth_data.conf).reshape(h, w)
-    #         depth_data['confidence_range'] = (np.min(depth_data['confidence_map']), np.max(depth_data['confidence_map']))
-    #     if threedn_depth_data.flags & ThreednDepthData.HAS_VIEWS:
-    #         views = np.array(threedn_depth_data.views)
-
-
-        # depth_data['confidence_map'] = np.array(threedn_depth_data.conf).reshape(h, w)
-        # depth_data['views'] = np.array(threedn_depth_data.views).reshape(h, w)
-
-
-
+    def export_dmaps(self, max_image_size: int = 800, max_workers: int = 4) -> None:
+        self.parallel_executor.run_in_parallel_no_return(
+            self.export_as_threedn_depth_data,
+            self.active_image_ids,
+            progress_desc="Exporting dmaps",
+            max_workers=max_workers
+        )
 
     def get_depth_data(self, image_id: int) -> dict:
         assert image_id in self.scene_depth_data, f"Image {image_id} not found in scene depth data"
@@ -737,12 +710,9 @@ class DensificationProblem:
         partner_image_ids = depth_data['partner_image_ids']
         partner_uvds = {}
 
-        depth_data['views'] = {}
-
         for partner_id in partner_image_ids:
             partner_data = self.get_depth_data(partner_id)
             partner_uvd = self.compute_consistency_map_depths(pts3d, valid_mask, partner_id)
-            depth_data['views'][partner_id] = (partner_uvd[:,:,2] > 0).astype(np.uint8)
             partner_valid_mask = valid_mask & (partner_uvd[:,:,2] > 0).astype(np.uint8)
             partner_uvd[partner_valid_mask,2] = 0
             partner_uvds[partner_id] = partner_uvd
