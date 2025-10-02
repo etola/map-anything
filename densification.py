@@ -264,14 +264,11 @@ class DensificationProblem:
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
 
-    def export_as_threedn_depth_data(self, image_id: int, max_image_size: int = 800, verbose: bool = False) -> None:
-        depth_data = self.get_depth_data(image_id)
-        threedn_depth_data = ThreednDepthData()
-        threedn_depth_data.magic = "DR"
 
+    def scale_depth_data(self, image_id: int, max_image_size: int = 800) -> None:
+        depth_data = self.get_depth_data(image_id)
         camera = self.reconstruction.get_image_camera(image_id)
         export_width, export_height = camera.width, camera.height
-
         if max(export_width, export_height) != max_image_size:
             scale = max_image_size / max(export_width, export_height)
             export_width = int(export_width * scale)
@@ -282,36 +279,59 @@ class DensificationProblem:
         K_scaled[0, :] *= export_width / depth_data['target_w']
         K_scaled[1, :] *= export_height / depth_data['target_h']
 
-        print(f"Exporting dmap for image {image_id} with size {export_width}x{export_height}")
+        cam_from_world = depth_data['camera_pose']
 
-        dmap = cv2.resize(depth_data['depth_map'], (export_width, export_height), cv2.INTER_LINEAR)
+        pts3d_world, valid_mask = depthmap_to_world_frame(depth_data['depth_map'], K, cam_from_world)
+        new_dmap = compute_depthmap(pts3d_world[valid_mask], K_scaled, cam_from_world, target_w=export_width, target_h=export_height)
 
-        if verbose:
-            rgb = colorize_heatmap(dmap, data_range=depth_data['depth_range'])
-            Image.fromarray(rgb).save(os.path.join(self.output_folder, f"depth_{image_id:06d}.png"))
-            pts3d_world, valid_mask = depthmap_to_world_frame(dmap, K_scaled, depth_data['camera_pose'])
-            pts3d = pts3d_world[valid_mask]
-            colors = depth_data['scaled_image'][valid_mask]
-            save_point_cloud(pts3d, colors, os.path.join(self.output_folder, f"scaled_point_cloud_{image_id:06d}.ply"))
+        depth_data['depth_map'] = new_dmap
+        depth_data['camera_intrinsics'] = K_scaled
+        depth_data['target_w'] = export_width
+        depth_data['target_h'] = export_height
 
+        image_path = os.path.join(self.scene_folder, "images", depth_data['image_name'])
+        img = Image.open(image_path)
+        if img.mode == "RGBA":
+            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
+            img = Image.alpha_composite(background, img)
+        img = np.array(img.resize((export_width, export_height), Image.Resampling.BICUBIC))
+        depth_data['scaled_image'] = img
+
+        depth_data['confidence_map'] = (new_dmap > 0).astype(np.float32)
+        depth_data['point_mask'] = (new_dmap > 0).astype(bool)
+        depth_data['prior_depth_map'] = None
+        depth_data['fused_depth_map'] = None
+        depth_data['consistency_map'] = None
+        depth_data['confidence_range'] = (0,1)
+
+
+    def export_as_threedn_depth_data(self, image_id: int) -> None:
+
+        depth_data = self.get_depth_data(image_id)
+        threedn_depth_data = ThreednDepthData()
+        threedn_depth_data.magic = "DR"
+
+        camera = self.reconstruction.get_image_camera(image_id)
+
+        dmap = depth_data['depth_map']
 
         threedn_depth_data.magic = "DR"
         threedn_depth_data.image_name = depth_data['image_name']
         threedn_depth_data.image_size = (camera.width, camera.height)
-        threedn_depth_data.depth_size = (export_width, export_height)
+        threedn_depth_data.depth_size = (dmap.shape[1], dmap.shape[0])
         threedn_depth_data.depth_range = np.min(dmap[dmap>0]), np.max(dmap[dmap>0])
 
         cam_from_world = depth_data['camera_pose']
         R = cam_from_world[:3, :3]
         t = cam_from_world[:3, 3]
         C = -R.T @ t
+        K = depth_data['camera_intrinsics']
 
-        threedn_depth_data.K = K_scaled.flatten().tolist()
+        threedn_depth_data.K = K.flatten().tolist()
         threedn_depth_data.R = R.flatten().tolist()
         threedn_depth_data.C = C.flatten().tolist()
         threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH
         threedn_depth_data.depthMap = dmap.flatten()
-        # threedn_depth_data.conf = cmap.flatten().tolist()
 
         partner_ids = depth_data['partner_image_ids'][:4]
         threedn_depth_data.neighbors = partner_ids
@@ -320,19 +340,22 @@ class DensificationProblem:
 
         threedn_depth_data.save(os.path.join(self.output_folder, f"depth{image_id:04d}.dmap"))
 
-    def export_dmaps(self, max_image_size: int = 800, max_workers: int = 4, verbose: bool = False) -> None:
+    def scale_depth_maps(self, max_image_size: int = 800, max_workers: int = 4) -> None:
+        self.parallel_executor.run_in_parallel_no_return(
+            self.scale_depth_data,
+            self.active_image_ids,
+            progress_desc="Scaling depth maps",
+            max_workers=max_workers
+        )
 
-        for image_id in self.active_image_ids:
-            self.export_as_threedn_depth_data(image_id, max_image_size, verbose=verbose)
-            self.save_heatmap(image_id, what_to_save="depth_map")
 
-
-        # self.parallel_executor.run_in_parallel_no_return(
-        #     self.export_as_threedn_depth_data,
-        #     self.active_image_ids,
-        #     progress_desc="Exporting dmaps",
-        #     max_workers=max_workers
-        # )
+    def export_dmaps(self, max_workers: int = 4) -> None:
+        self.parallel_executor.run_in_parallel_no_return(
+            self.export_as_threedn_depth_data,
+            self.active_image_ids,
+            progress_desc="Exporting dmaps",
+            max_workers=max_workers
+        )
 
     def get_depth_data(self, image_id: int) -> dict:
         assert image_id in self.scene_depth_data, f"Image {image_id} not found in scene depth data"
