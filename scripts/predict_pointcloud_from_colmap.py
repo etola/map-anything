@@ -258,8 +258,8 @@ def main():
                 torch.cuda.empty_cache()
 
         densification_problem.save_current_state()
+        densification_problem.export_dmaps(max_image_size=800, max_workers=4)
 
-    densification_problem.export_dmaps(max_image_size=800, max_workers=4)
     densification_problem.apply_fusion()
     densification_problem.export_fused_point_cloud(file_name="fused.ply")
 
