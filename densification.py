@@ -264,7 +264,7 @@ class DensificationProblem:
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
 
-    def export_as_threedn_depth_data(self, image_id: int, max_image_size: int = 800) -> None:
+    def export_as_threedn_depth_data(self, image_id: int, max_image_size: int = 800, verbose: bool = False) -> None:
         depth_data = self.get_depth_data(image_id)
         threedn_depth_data = ThreednDepthData()
         threedn_depth_data.magic = "DR"
@@ -272,19 +272,28 @@ class DensificationProblem:
         camera = self.reconstruction.get_image_camera(image_id)
         export_width, export_height = camera.width, camera.height
 
-        if export_width > max_image_size or export_height > max_image_size:
+        if max(export_width, export_height) != max_image_size:
             scale = max_image_size / max(export_width, export_height)
             export_width = int(export_width * scale)
             export_height = int(export_height * scale)
+
+        K = depth_data['camera_intrinsics']
+        K_scaled = K.copy()
+        K_scaled[0, :] *= export_width / depth_data['target_w']
+        K_scaled[1, :] *= export_height / depth_data['target_h']
 
         print(f"Exporting dmap for image {image_id} with size {export_width}x{export_height}")
 
         dmap = cv2.resize(depth_data['depth_map'], (export_width, export_height), cv2.INTER_LINEAR)
 
-        rgb = colorize_heatmap(dmap, data_range=depth_data['depth_range'])
-        Image.fromarray(rgb).save(os.path.join(self.output_folder, f"depth_{image_id:06d}.png"))
+        if verbose:
+            rgb = colorize_heatmap(dmap, data_range=depth_data['depth_range'])
+            Image.fromarray(rgb).save(os.path.join(self.output_folder, f"depth_{image_id:06d}.png"))
+            pts3d_world, valid_mask = depthmap_to_world_frame(dmap, K_scaled, depth_data['camera_pose'])
+            pts3d = pts3d_world[valid_mask]
+            colors = depth_data['scaled_image'][valid_mask]
+            save_point_cloud(pts3d, colors, os.path.join(self.output_folder, f"scaled_point_cloud_{image_id:06d}.ply"))
 
-        # cmap = cv2.resize(depth_data['confidence_map'], (export_width, export_height), cv2.INTER_LINEAR)
 
         threedn_depth_data.magic = "DR"
         threedn_depth_data.image_name = depth_data['image_name']
@@ -297,7 +306,7 @@ class DensificationProblem:
         t = cam_from_world[:3, 3]
         C = -R.T @ t
 
-        threedn_depth_data.K = depth_data['camera_intrinsics'].flatten().tolist()
+        threedn_depth_data.K = K_scaled.flatten().tolist()
         threedn_depth_data.R = R.flatten().tolist()
         threedn_depth_data.C = C.flatten().tolist()
         threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH
@@ -311,10 +320,10 @@ class DensificationProblem:
 
         threedn_depth_data.save(os.path.join(self.output_folder, f"depth{image_id:04d}.dmap"))
 
-    def export_dmaps(self, max_image_size: int = 800, max_workers: int = 4) -> None:
+    def export_dmaps(self, max_image_size: int = 800, max_workers: int = 4, verbose: bool = False) -> None:
 
         for image_id in self.active_image_ids:
-            self.export_as_threedn_depth_data(image_id, max_image_size)
+            self.export_as_threedn_depth_data(image_id, max_image_size, verbose=verbose)
             self.save_heatmap(image_id, what_to_save="depth_map")
 
 
