@@ -267,6 +267,7 @@ class DensificationProblem:
     def export_as_threedn_depth_data(self, image_id: int, max_image_size: int = 800) -> None:
         depth_data = self.get_depth_data(image_id)
         threedn_depth_data = ThreednDepthData()
+        threedn_depth_data.magic = "DR"
 
         camera = self.reconstruction.get_image_camera(image_id)
         export_width, export_height = camera.width, camera.height
@@ -279,8 +280,13 @@ class DensificationProblem:
         print(f"Exporting dmap for image {image_id} with size {export_width}x{export_height}")
 
         dmap = cv2.resize(depth_data['depth_map'], (export_width, export_height), cv2.INTER_LINEAR)
-        cmap = cv2.resize(depth_data['confidence_map'], (export_width, export_height), cv2.INTER_LINEAR)
 
+        rgb = colorize_heatmap(dmap, data_range=depth_data['depth_range'])
+        Image.fromarray(rgb).save(os.path.join(self.output_folder, f"depth_{image_id:06d}.png"))
+
+        # cmap = cv2.resize(depth_data['confidence_map'], (export_width, export_height), cv2.INTER_LINEAR)
+
+        threedn_depth_data.magic = "DR"
         threedn_depth_data.image_name = depth_data['image_name']
         threedn_depth_data.image_size = (camera.width, camera.height)
         threedn_depth_data.depth_size = (export_width, export_height)
@@ -291,12 +297,12 @@ class DensificationProblem:
         t = cam_from_world[:3, 3]
         C = -R.T @ t
 
-        threedn_depth_data.K = depth_data['camera_intrinsics']
-        threedn_depth_data.R = R
-        threedn_depth_data.C = C
-        threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH | ThreednDepthData.HAS_CONF
-        threedn_depth_data.depthMap = dmap.flatten().tolist()
-        threedn_depth_data.conf = cmap.flatten().tolist()
+        threedn_depth_data.K = depth_data['camera_intrinsics'].flatten().tolist()
+        threedn_depth_data.R = R.flatten().tolist()
+        threedn_depth_data.C = C.flatten().tolist()
+        threedn_depth_data.flags = ThreednDepthData.HAS_DEPTH
+        threedn_depth_data.depthMap = dmap.flatten()
+        # threedn_depth_data.conf = cmap.flatten().tolist()
 
         partner_ids = depth_data['partner_image_ids'][:4]
         threedn_depth_data.neighbors = partner_ids
@@ -306,12 +312,18 @@ class DensificationProblem:
         threedn_depth_data.save(os.path.join(self.output_folder, f"depth{image_id:04d}.dmap"))
 
     def export_dmaps(self, max_image_size: int = 800, max_workers: int = 4) -> None:
-        self.parallel_executor.run_in_parallel_no_return(
-            self.export_as_threedn_depth_data,
-            self.active_image_ids,
-            progress_desc="Exporting dmaps",
-            max_workers=max_workers
-        )
+
+        for image_id in self.active_image_ids:
+            self.export_as_threedn_depth_data(image_id, max_image_size)
+            self.save_heatmap(image_id, what_to_save="depth_map")
+
+
+        # self.parallel_executor.run_in_parallel_no_return(
+        #     self.export_as_threedn_depth_data,
+        #     self.active_image_ids,
+        #     progress_desc="Exporting dmaps",
+        #     max_workers=max_workers
+        # )
 
     def get_depth_data(self, image_id: int) -> dict:
         assert image_id in self.scene_depth_data, f"Image {image_id} not found in scene depth data"

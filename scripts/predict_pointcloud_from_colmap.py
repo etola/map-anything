@@ -211,6 +211,8 @@ def main():
     """Main function."""
     args = parse_args()
     
+    test_dmaps(args.scene_folder)
+
     # Print configuration
     print("Arguments:", vars(args))
     

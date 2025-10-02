@@ -162,7 +162,8 @@ class ThreednDepthData:
                 if self.flags & self.HAS_VIEWS:
                     fout.write(struct.pack(f"{len(self.views)}I", *self.views.tolist()))
                 return True
-        except Exception:
+        except Exception as e:
+            print(f"Error saving dmap: {e}")
             return False
 
     def __bool__(self):
