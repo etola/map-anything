@@ -265,18 +265,19 @@ class DensificationProblem:
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
 
-    def scale_depth_data(self, image_id: int, max_image_size: int) -> None:
+    def scale_depth_data(self, image_id: int, new_w: int, new_h: int) -> None:
 
         depth_data = self.get_depth_data(image_id)
         if depth_data['depth_map'] is None:
+            depth_data['target_w'] = new_w
+            depth_data['target_h'] = new_h
+            depth_data['scaled_image'] = None
+            self.initialize_scaled_image(image_id)
             return
 
         # Extract camera intrinsics and scale for target size
         camera = self.reconstruction.get_image_camera(image_id)
         original_width, original_height = camera.width, camera.height
-
-        new_w = int(original_width  * max_image_size / max(original_width, original_height))
-        new_h = int(original_height * max_image_size / max(original_width, original_height))
 
         if new_w == original_width and new_h == original_height:
             return
@@ -289,7 +290,8 @@ class DensificationProblem:
         K_scaled[1, :] *= scale_y  # Scale fy and cy
 
         depth_data['depth_map'] = cv2.resize(depth_data['depth_map'], (new_w, new_h), cv2.INTER_LINEAR)
-        depth_data['confidence_map'] = cv2.resize(depth_data['confidence_map'], (new_w, new_h), cv2.INTER_LINEAR)
+        if depth_data['confidence_map'] is not None:
+            depth_data['confidence_map'] = cv2.resize(depth_data['confidence_map'], (new_w, new_h), cv2.INTER_LINEAR)
 
         depth_data['target_w'] = new_w
         depth_data['target_h'] = new_h
@@ -328,7 +330,7 @@ class DensificationProblem:
             save_point_cloud(pts3d, colors, os.path.join(self.output_folder, f"scaled_point_cloud_{image_id:06d}.ply"))
 
         threedn_depth_data.magic = "DR"
-        threedn_depth_data.image_name = 'images/' + depth_data['image_name']
+        threedn_depth_data.image_name = os.path.join('images', os.path.basename(depth_data['image_name']))
         threedn_depth_data.image_size = (export_width, export_height)
         threedn_depth_data.depth_size = (export_width, export_height)
         threedn_depth_data.depth_range = np.min(dmap[dmap>0]), np.max(dmap[dmap>0])
@@ -925,49 +927,58 @@ class DensificationProblem:
 
         depth_data['fused_depth_map'] = fused_dmap
 
-    def scale_all_depth_data(self, max_image_size: int):
+    def scale_all_depth_data(self, max_image_size: int, is_square: bool = False):
 
         new_w = None
         new_h = None
+        if is_square:
+            new_w = max_image_size
+            new_h = max_image_size
+        else:
+            for image_id in self.active_image_ids:
+                depth_data = self.get_depth_data(image_id)
+                camera = self.reconstruction.get_image_camera(image_id)
+                original_width, original_height = camera.width, camera.height
+                if new_w == None and new_h == None:
+                    new_w = int(original_width  * max_image_size / max(original_width, original_height))
+                    new_h = int(original_height * max_image_size / max(original_width, original_height))
+                else:
+                    img_w = int(original_width  * max_image_size / max(original_width, original_height))
+                    img_h = int(original_height * max_image_size / max(original_width, original_height))
 
-        for image_id in self.active_image_ids:
-            depth_data = self.get_depth_data(image_id)
-            camera = self.reconstruction.get_image_camera(image_id)
-            original_width, original_height = camera.width, camera.height
-            if new_w == None and new_h == None:
-                new_w = int(original_width  * max_image_size / max(original_width, original_height))
-                new_h = int(original_height * max_image_size / max(original_width, original_height))
-            else:
-                img_w = int(original_width  * max_image_size / max(original_width, original_height))
-                img_h = int(original_height * max_image_size / max(original_width, original_height))
-
-                if img_w != new_w or img_h != new_h:
-                    raise ValueError(f"Image {image_id} has size {img_w}x{img_h} which does not match target size {new_w}x{new_h}")
+                    if img_w != new_w or img_h != new_h:
+                        raise ValueError(f"Image {image_id} has size {img_w}x{img_h} which does not match target size {new_w}x{new_h}")
 
         self.target_w = new_w
         self.target_h = new_h
+
+
+        # for image_id in self.active_image_ids:
+        #     self.scale_depth_data(image_id, new_w, new_h)
+
 
         self.parallel_executor.run_in_parallel_no_return(
             self.scale_depth_data,
             self.active_image_ids,
             progress_desc="Scaling depth data",
             max_workers=4,
-            max_image_size=max_image_size
+            new_w=new_w,
+            new_h=new_h
         )
 
 
 
     def apply_fusion(self):
 
-        for image_id in self.active_image_ids:
-            self.fuse_for_image(image_id)
+        # for image_id in self.active_image_ids:
+        #     self.fuse_for_image(image_id)
 
-        # self.parallel_executor.run_in_parallel_no_return(
-        #     self.fuse_for_image,
-        #     self.active_image_ids,
-        #     progress_desc="Fusing depth maps",
-        #     max_workers=8
-        # )
+        self.parallel_executor.run_in_parallel_no_return(
+            self.fuse_for_image,
+            self.active_image_ids,
+            progress_desc="Fusing depth maps",
+            max_workers=8
+        )
 
     def export_fused_point_cloud(self, stepping: int = 1, file_name: str = "fused.ply", use_parallel: bool = True):
 
@@ -1239,4 +1250,23 @@ class DensificationProblem:
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
             depth_data['prior_depth_map'] = depth_data['fused_depth_map']
+            depth_data['depth_map'] = depth_data['fused_depth_map']
+            depth_data['fused_depth_map'] = None
+            depth_data['point_map'] = None
+            depth_data['confidence_map'] = None
+            depth_data['consistency_map'] = None
+
+    def transfer_depthmap_to_prior(self) -> None:
+        for image_id in self.active_image_ids:
+            depth_data = self.get_depth_data(image_id)
+            depth_data['prior_depth_map'] = depth_data['depth_map']
+            depth_data['depth_map'] = None
+            depth_data['fused_depth_map'] = None
+            depth_data['point_map'] = None
+            depth_data['confidence_map'] = None
+            depth_data['consistency_map'] = None
+
+
+
+
 
