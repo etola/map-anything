@@ -152,8 +152,8 @@ class DensificationProblem:
         'camera_intrinsics'     : K_scaled,  # scaled intrinsics for target_h x target_w image
         'camera_pose'           : pose_4x4,        # Use 4x4 cam_from_world pose matrix for projecting world points to camera frame
         'original_intrinsics'   : K,       # original intrinsics for original image,
-        'h'                     : height of the maps,
-        'w'                     : width of the maps
+        'target_h'              : height of the maps,
+        'target_w'              : width of the maps
 
     """
     
@@ -264,6 +264,47 @@ class DensificationProblem:
         with self._lock:
             self.scene_depth_data[image_id] = depth_data
 
+    def scale_depth_data(self, image_id: int, max_image_size: int) -> None:
+
+        depth_data = self.get_depth_data(image_id)
+        if depth_data['depth_map'] is None:
+            return
+
+        # Extract camera intrinsics and scale for target size
+        camera = self.reconstruction.get_image_camera(image_id)
+        original_width, original_height = camera.width, camera.height
+
+        new_w = int(original_width  * max_image_size / max(original_width, original_height))
+        new_h = int(original_height * max_image_size / max(original_width, original_height))
+
+        if new_w == original_width and new_h == original_height:
+            return
+
+        K = self.reconstruction.get_camera_calibration_matrix(image_id)
+        scale_x = new_w / original_width
+        scale_y = new_h / original_height
+        K_scaled = K.copy()
+        K_scaled[0, :] *= scale_x  # Scale fx and cx
+        K_scaled[1, :] *= scale_y  # Scale fy and cy
+
+        depth_data['depth_map'] = cv2.resize(depth_data['depth_map'], (new_w, new_h), cv2.INTER_LINEAR)
+        depth_data['confidence_map'] = cv2.resize(depth_data['confidence_map'], (new_w, new_h), cv2.INTER_LINEAR)
+
+        depth_data['target_w'] = new_w
+        depth_data['target_h'] = new_h
+        depth_data['scaled_image'] = None
+        self.initialize_scaled_image(image_id)
+
+        valid_mask = (depth_data['depth_map'] > 0).astype(bool)
+
+        depth_data['point_mask'] = valid_mask
+        depth_data['prior_depth_map'] = None
+        depth_data['fused_depth_map'] = None
+
+
+        depth_data['camera_intrinsics'] = K_scaled
+
+
     def export_as_threedn_depth_data(self, image_id: int, max_image_size: int = 800, verbose: bool = False) -> None:
         depth_data = self.get_depth_data(image_id)
         threedn_depth_data = ThreednDepthData()
@@ -351,8 +392,6 @@ class DensificationProblem:
                 depth_data[key] = data[key].item()
             else:
                 depth_data[key] = data[key]
-        assert self.target_w == depth_data['target_w']
-        assert self.target_h == depth_data['target_h']
         assert self.reconstruction.has_image(image_id)
         return depth_data
 
@@ -415,8 +454,7 @@ class DensificationProblem:
         ref_image_id = self.source_to_target_image_id_mapping[image_id]
         assert ref_image_id is not None, f"No target image id found for image {image_id}"
         
-        # This is the expensive operation - 3D point projection
-        prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], self.target_w, self.target_h, min_track_length=1)
+        prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], depth_data['target_w'], depth_data['target_h'], min_track_length=1)
         
         if prior_depth_map is None:
             print(f"Warning: No prior depth map found for image {image_id}")
@@ -438,7 +476,7 @@ class DensificationProblem:
             img = Image.alpha_composite(background, img)
         img = img.convert("RGB")
         # Convert PIL Image to numpy array for consistent indexing
-        depth_data['scaled_image'] = np.array(img.resize((depth_data['target_h'], depth_data['target_w']), Image.Resampling.BICUBIC))
+        depth_data['scaled_image'] = np.array(img.resize((depth_data['target_w'], depth_data['target_h']), Image.Resampling.BICUBIC))
 
     def update_depth_data(self, image_id: int, depth_map: np.ndarray, confidence_map: np.ndarray) -> None:
         depth_data = self.get_depth_data(image_id)
@@ -665,7 +703,11 @@ class DensificationProblem:
             Image.fromarray(rgb).save(os.path.join(self.depth_data_folder, f"prior_depth_{image_id:06d}.png"))
 
         elif what_to_save == "all":
-            empty = np.zeros((depth_data['target_h'], depth_data['target_w'], 3), dtype=np.uint8)
+
+            H = depth_data['target_h']
+            W = depth_data['target_w']
+
+            empty = np.zeros((H, W, 3), dtype=np.uint8)
             depth_rgb = colorize_heatmap(depth_data['depth_map'], data_range=depth_data['depth_range']) if depth_data['depth_map'] is not None else empty
             conf_rgb  = colorize_heatmap(depth_data['confidence_map'], data_range=depth_data['confidence_range']) if depth_data['confidence_map'] is not None else empty
             prior_rgb = colorize_heatmap(depth_data['prior_depth_map'], data_range=depth_data['depth_range']) if depth_data['prior_depth_map'] is not None else empty
@@ -673,9 +715,9 @@ class DensificationProblem:
             consistency_rgb = colorize_heatmap(depth_data['consistency_map'], data_range=(0, self.fusion_max_partners-1)) if depth_data['consistency_map'] is not None else empty
 
             # generate a legend image
-            legend_image = np.zeros((self.target_h, 50), dtype=np.float32)
+            legend_image = np.zeros((H, 50), dtype=np.float32)
             for i in range(self.fusion_max_partners):
-                legend_image[i*self.target_h//self.fusion_max_partners:(i+1)*self.target_h//self.fusion_max_partners, :] = i
+                legend_image[i*H//self.fusion_max_partners:(i+1)*H//self.fusion_max_partners, :] = i
             legend_rgb = colorize_heatmap(legend_image, data_range=(0, self.fusion_max_partners-1))
 
             combined = np.concatenate([depth_data['scaled_image'], prior_rgb, depth_rgb, fusion_rgb, conf_rgb, consistency_rgb, legend_rgb], axis=1)
@@ -754,6 +796,37 @@ class DensificationProblem:
 
         depth_data['fused_depth_map'] = fused_dmap
 
+    def scale_all_depth_data(self, max_image_size: int):
+
+        new_w = None
+        new_h = None
+
+        for image_id in self.active_image_ids:
+            depth_data = self.get_depth_data(image_id)
+            camera = self.reconstruction.get_image_camera(image_id)
+            original_width, original_height = camera.width, camera.height
+            if new_w == None and new_h == None:
+                new_w = int(original_width  * max_image_size / max(original_width, original_height))
+                new_h = int(original_height * max_image_size / max(original_width, original_height))
+            else:
+                img_w = int(original_width  * max_image_size / max(original_width, original_height))
+                img_h = int(original_height * max_image_size / max(original_width, original_height))
+
+                if img_w != new_w or img_h != new_h:
+                    raise ValueError(f"Image {image_id} has size {img_w}x{img_h} which does not match target size {new_w}x{new_h}")
+
+        self.target_w = new_w
+        self.target_h = new_h
+
+        self.parallel_executor.run_in_parallel_no_return(
+            self.scale_depth_data,
+            self.active_image_ids,
+            progress_desc="Scaling depth data",
+            max_workers=4,
+            max_image_size=max_image_size
+        )
+
+
 
     def apply_fusion(self):
 
@@ -762,15 +835,15 @@ class DensificationProblem:
         #     # filter point mask by confidence here if you want
         #     # depth_data['point_mask'] &= (depth_data['confidence_map'] > 0).astype(bool)
 
-        for image_id in self.active_image_ids:
-            self.fuse_for_image(image_id)
+        # for image_id in self.active_image_ids:
+        #     self.fuse_for_image(image_id)
 
-        # self.parallel_executor.run_in_parallel_no_return(
-        #     self.fuse_for_image,
-        #     self.active_image_ids,
-        #     progress_desc="Fusing depth maps",
-        #     max_workers=4
-        # )
+        self.parallel_executor.run_in_parallel_no_return(
+            self.fuse_for_image,
+            self.active_image_ids,
+            progress_desc="Fusing depth maps",
+            max_workers=8
+        )
 
     def export_fused_point_cloud(self, stepping: int = 1, file_name: str = "fused.ply", use_parallel: bool = True):
 
@@ -789,12 +862,6 @@ class DensificationProblem:
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
             depth_data['exported_mask'] = np.zeros_like(depth_data['depth_map'], dtype=bool)
-
-        # Create stepping mask once if needed (vectorized)
-        stepping_mask = None
-        if stepping > 1:
-            stepping_mask = np.zeros_like(depth_data['depth_map'], dtype=bool)
-            stepping_mask[::stepping, ::stepping] = True
 
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
@@ -819,7 +886,9 @@ class DensificationProblem:
                         partner_data['exported_mask'][uv[:, 1], uv[:, 0]] = True
 
                 # Now apply stepping mask to choose which points to export from this image
-                if stepping_mask is not None:
+                if stepping > 1:
+                    stepping_mask = np.zeros((depth_data['target_h'], depth_data['target_w']), dtype=bool)
+                    stepping_mask[::stepping, ::stepping] = True
                     valid_mask &= stepping_mask
 
                 # Extract points and colors
@@ -853,12 +922,6 @@ class DensificationProblem:
         data_lock = Lock()
         mask_locks = {img_id: Lock() for img_id in self.active_image_ids}
         
-        # Create stepping mask once if needed (vectorized)
-        stepping_mask = None
-        if stepping > 1:
-            stepping_mask = np.zeros((self.target_h, self.target_w), dtype=bool)
-            stepping_mask[::stepping, ::stepping] = True
-        
         def process_image(image_id: int):
             """Process a single image in parallel"""
             depth_data = self.get_depth_data(image_id)
@@ -891,7 +954,9 @@ class DensificationProblem:
                             partner_data['exported_mask'][uv[:, 1], uv[:, 0]] = True
 
             # Now apply stepping mask to choose which points to export from this image
-            if stepping_mask is not None:
+            if stepping > 1:
+                stepping_mask = np.zeros((depth_data['target_h'], depth_data['target_w']), dtype=bool)
+                stepping_mask[::stepping, ::stepping] = True
                 valid_mask &= stepping_mask
                             
             # Extract points and colors
@@ -938,13 +1003,13 @@ class DensificationProblem:
         partner_depth_data = self.get_depth_data(partner_id)
         partner_depth_map = partner_depth_data['depth_map']
         if partner_depth_map is None:
-            return np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
+            return np.zeros_like(points_3d, dtype=np.float32)
 
         partner_intrinsics = partner_depth_data['camera_intrinsics']
         partner_pose = partner_depth_data['camera_pose']  # cam_from_world for partner
         
         # Initialize consistency map (default to invalid [u, v, depth])
-        consistency_map = np.zeros((self.target_h, self.target_w, 3), dtype=np.float32)
+        consistency_map = np.zeros_like(points_3d, dtype=np.float32)
         
         # Extract valid 3D points and their original coordinates
         valid_points_3d = points_3d[valid_mask]  # Shape: (N, 3)
@@ -977,11 +1042,13 @@ class DensificationProblem:
         partner_pixel_x = proj_coords[:, 0].astype(int)
         partner_pixel_y = proj_coords[:, 1].astype(int)
         projected_depths = cam_coords[:, 2]
-        
+
+        H,W = partner_depth_map.shape
+
         # Filter points within image bounds
         in_bounds_mask = (
-            (partner_pixel_x >= 0) & (partner_pixel_x < self.target_w) &
-            (partner_pixel_y >= 0) & (partner_pixel_y < self.target_h)
+            (partner_pixel_x >= 0) & (partner_pixel_x < W) &
+            (partner_pixel_y >= 0) & (partner_pixel_y < H)
         )
         
         if not np.any(in_bounds_mask):
