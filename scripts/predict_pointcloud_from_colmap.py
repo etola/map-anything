@@ -79,6 +79,12 @@ def parse_args():
         help="Resolution for MapAnything model inference (default: 518)",
     )
     parser.add_argument(
+        "-e", "--export_resolution",
+        type=int,
+        default=0,
+        help="Resolution to export 3dn depthmap format (default: 0 -> disables export)",
+    )
+    parser.add_argument(
         "-c", "--conf_threshold",
         type=float,
         default=0.0,
@@ -193,13 +199,6 @@ def run_depth_completion(model, depth_problem, image_ids, memory_efficient_infer
         
     del predictions
 
-# def test_dmaps(workfolder):
-#     from threedn_depth_data import ThreednDepthData
-#     tdn_folder = os.path.join(workfolder, "workfolder")
-#     dmap7 = ThreednDepthData()
-#     dmap7.load(os.path.join(tdn_folder, "depth0007.dmap"))
-#     print(dmap7.depthMap.shape)
-
 
 def main():
     """Main function."""
@@ -213,13 +212,10 @@ def main():
 
     densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.resolution, args.output_folder)
 
-    if densification_problem.is_precomputed_depth_data_present():
-        print("Precomputed depth data found, skipping initialization")
-        densification_problem.initialize_from_folder()
-    else:
-        print("No precomputed depth data found")
-        if args.reference_reconstruction is not None:
-            densification_problem.initialize_with_reference(args.reference_reconstruction)
+    threedn_folder = os.path.join(args.scene_folder, "threedn")
+    if os.path.exists(threedn_folder):
+        print(f"Threedn folder found, initializing from threedn")
+        densification_problem.initialize_from_threedn(prior=True, verbose=args.verbose)
 
         # Initialize model
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -248,11 +244,53 @@ def main():
                 run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
                 # Clear GPU memory
                 torch.cuda.empty_cache()
-
         densification_problem.save_current_state()
-        # densification_problem.export_dmaps(max_image_size=800, max_workers=4, verbose=args.verbose)
 
-    densification_problem.scale_all_depth_data(800)
+        # densification_problem.export_dmaps(max_workers=8, verbose=args.verbose)
+
+
+    # if densification_problem.is_precomputed_depth_data_present():
+    #     print("Precomputed depth data found, skipping initialization")
+    #     densification_problem.initialize_from_folder()
+    # else:
+    #     print("No precomputed depth data found")
+    #     if args.reference_reconstruction is not None:
+    #         densification_problem.initialize_with_reference(args.reference_reconstruction)
+
+    #     # Initialize model
+    #     device = "cuda" if torch.cuda.is_available() else "cpu"
+    #     print(f"Using device: {device}")
+    #     if args.apache:
+    #         model_name = "facebook/map-anything-apache"
+    #         print("Loading Apache 2.0 licensed MapAnything model...")
+    #     else:
+    #         model_name = "facebook/map-anything"
+    #         print("Loading CC-BY-NC 4.0 licensed MapAnything model...")
+    #     model = MapAnything.from_pretrained(model_name).to(device)
+    #     model.eval()
+
+    #     if args.smart_batching:
+    #         print("Using smart batching based on COLMAP reconstruction quality...")
+    #         batches = densification_problem.get_batches_geometric(args.batch_size)
+    #         print(f"Processing {len(batches)} smart batches with max batch size {args.batch_size}")
+    #     else:
+    #         print("Using sequential batching...")
+    #         batches = densification_problem.get_batches_sequential(args.batch_size)
+    #         print(f"Processing {len(batches)} sequential batches with batch size {args.batch_size}")
+        
+    #     for batch_idx, batch_image_ids in enumerate(batches):
+    #         print(f"Processing batch {batch_idx}/{len(batches)} with {len(batch_image_ids)} images")
+    #         with torch.no_grad():
+    #             run_depth_completion(model, densification_problem, batch_image_ids, args.memory_efficient_inference, args.verbose)
+    #             # Clear GPU memory
+    #             torch.cuda.empty_cache()
+
+    #     densification_problem.save_current_state()
+
+    # if args.export_resolution > 0:
+    #     print(f"Exporting 3dn depthmaps at resolution {args.export_resolution}")
+    #     densification_problem.scale_all_depth_data(args.export_resolution)
+    #     densification_problem.export_dmaps(max_workers=8, verbose=args.verbose)
 
     densification_problem.apply_fusion()
     densification_problem.export_fused_point_cloud(file_name="fused.ply", use_parallel=True)

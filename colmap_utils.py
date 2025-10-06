@@ -45,7 +45,8 @@ class ColmapReconstruction:
         self._image_point3D_xy: Optional[Dict[int, Dict[int, np.ndarray]]] = None
         
         # Cached bounding box computation
-        self._bbox_cache = {}
+        self.bbox_min = None
+        self.bbox_max = None
 
         # cached image name mapping
         self._image_folder = ""
@@ -300,18 +301,7 @@ class ColmapReconstruction:
         Returns:
             bbox_min, bbox_max: 3D coordinates of bounding box corners
         """
-        # Create cache key from parameters
-        cache_key = (min_visibility, padding_factor)
-        
-        # Return cached result if available
-        if cache_key in self._bbox_cache:
-            bbox_min, bbox_max = self._bbox_cache[cache_key]
-            if bbox_min is not None and bbox_max is not None and verbose:
-                print(f"Using cached bounding box (min_visibility={min_visibility}, padding={padding_factor})")
-                print(f"  Min: [{bbox_min[0]:.3f}, {bbox_min[1]:.3f}, {bbox_min[2]:.3f}]")
-                print(f"  Max: [{bbox_max[0]:.3f}, {bbox_max[1]:.3f}, {bbox_max[2]:.3f}]")
-            return bbox_min, bbox_max
-        
+
         robust_points = []
         
         # Collect 3D points with sufficient visibility
@@ -328,9 +318,7 @@ class ColmapReconstruction:
         if len(robust_points) == 0:
             if verbose:
                 print("Warning: No 3D points found in reconstruction")
-            # Cache the failure result
-            self._bbox_cache[cache_key] = (None, None)
-            return None, None
+            return
         
         robust_points = np.array(robust_points)
         
@@ -345,15 +333,15 @@ class ColmapReconstruction:
         bbox_max += padding
         
         # Cache the result
-        self._bbox_cache[cache_key] = (bbox_min.copy(), bbox_max.copy())
-        
+        self.bbox_min = bbox_min.copy()
+        self.bbox_max = bbox_max.copy()
+
         if verbose:
             print(f"Computed robust bounding box from {len(robust_points)} points (min_visibility={min_visibility})")
             print(f"  Min: [{bbox_min[0]:.3f}, {bbox_min[1]:.3f}, {bbox_min[2]:.3f}]")
             print(f"  Max: [{bbox_max[0]:.3f}, {bbox_max[1]:.3f}, {bbox_max[2]:.3f}]")
             print(f"  Size: [{bbox_size[0]:.3f}, {bbox_size[1]:.3f}, {bbox_size[2]:.3f}]")
         
-        return bbox_min, bbox_max
     
     # Accessor methods for clean API
     def has_image(self, image_id: int) -> bool:
@@ -1053,6 +1041,29 @@ def load_reconstruction(reconstruction_path):
         return ColmapReconstruction(reconstruction_path)
     except Exception as e:
         raise ValueError(f"Failed to load COLMAP reconstruction from {reconstruction_path}: {e}")
+
+def find_exact_image_match_from_extrinsics(target_reconstruction: ColmapReconstruction, R: np.ndarray, t: np.ndarray):
+    """
+    Find the exact match of R,C from target reconstruction.
+    """
+
+    for image_id in target_reconstruction.get_all_image_ids():
+        target_pose = target_reconstruction.get_image_cam_from_world(image_id)
+        target_R = target_pose.rotation.matrix()
+        target_t = target_pose.translation
+        R_rel = R.T @ target_R
+        trace_R = np.trace(R_rel)
+        cos_angle = (trace_R - 1) / 2
+        cos_angle = np.clip(cos_angle, -1.0, 1.0)  # Clamp for numerical stability
+        rotation_angle = np.arccos(cos_angle)  # Rotation angle in radians
+
+        translation_diff = np.linalg.norm(t.flatten() - target_t.flatten())
+
+        if rotation_angle < 1e-6 and translation_diff < 1e-6:
+            return image_id
+
+    return None
+
 
 
 def find_exact_image_match(source_reconstruction: ColmapReconstruction, target_reconstruction: ColmapReconstruction, source_image_id: int):
