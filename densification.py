@@ -533,7 +533,18 @@ class DensificationProblem:
             if verbose:
                 self.save_cloud(img_id, use_prior_depth=prior, file_name=f"threedn_{img_id:06d}.ply")
 
+    def initialize_from_sfm_depth(self, min_track_length: int = 3, verbose: bool = False):
 
+        print("Initializing depth data for all active images using SfM depth...")
+        for img_id in self.active_image_ids:
+            self.initialize_depth_data(img_id)
+            self.initialize_prior_depth_data_from_sfm(img_id, min_track_length=min_track_length)
+
+        self.parallel_executor.run_in_parallel_no_return(
+            self.initialize_scaled_image,
+            self.active_image_ids,
+            progress_desc="Loading and Scaling Images"
+        )            
 
 
     def initialize_with_reference(self, reference_reconstruction) -> None:
@@ -558,7 +569,7 @@ class DensificationProblem:
 
         for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
-            self.initialize_prior_depth_data_from_reference(img_id)
+            # self.initialize_prior_depth_data_from_reference(img_id)
 
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_prior_depth_data_from_reference,
@@ -573,6 +584,13 @@ class DensificationProblem:
             progress_desc="Loading and Scaling Images"
         )
 
+    def initialize_prior_depth_data_from_sfm(self, image_id: int, min_track_length: int = 3) -> None:
+        depth_data = self.get_depth_data(image_id)
+        prior_depth_map, depth_range = compute_image_depthmap(self.reconstruction, image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], depth_data['target_w'], depth_data['target_h'], min_track_length=min_track_length)
+        if prior_depth_map is None:
+            print(f"Warning: No prior depth map found for image {image_id} with min_track_length={min_track_length}")
+        depth_data['prior_depth_map'] = prior_depth_map
+        depth_data['depth_range'] = depth_range
 
     def initialize_prior_depth_data_from_reference(self, image_id: int) -> None:
         if self.reference_reconstruction is None:

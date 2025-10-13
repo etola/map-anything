@@ -124,12 +124,14 @@ def parse_args():
         default=None,
         help="Path to reference lidar fused cloud in COLMAP reconstruction format for prior depth information (default: None)",
     )
+    parser.add_argument("--use_sfm_prior", action="store_true", default=False, help="Use SfM depth for prior depth information")
     parser.add_argument(
         "-v", "--verbose",
         action="store_true",
         default=False,
         help="Enable verbose output and save colorized prior and predicted depth maps",
     )
+    parser.add_argument("--min_track_length", "-t", type=int, default=3, help="Minimum track length for SfM depth to be used for prior depth information")
     return parser.parse_args()
 
 
@@ -216,7 +218,7 @@ def main():
     densification_problem = DensificationProblem(args.scene_folder, args.resolution, args.resolution, args.output_folder)
 
     fuse_lidar_dmaps = False
-    init_from_threedn_dmaps = True
+    init_from_threedn_dmaps = False
     #
     # fuse lidar dmaps;
     #
@@ -236,7 +238,11 @@ def main():
 
         else:
 
-            if init_from_threedn_dmaps:
+            if args.use_sfm_prior:
+                print("Using SfM depth for prior depth information")
+                densification_problem.initialize_from_sfm_depth(min_track_length=args.min_track_length, verbose=args.verbose)
+
+            elif init_from_threedn_dmaps:
                 print(f"Threedn folder found, initializing from threedn")
                 threedn_folder = os.path.join(args.scene_folder, "threedn")
                 densification_problem.initialize_from_threedn(prior=False, verbose=args.verbose)
