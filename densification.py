@@ -133,6 +133,54 @@ class ParallelExecutor:
         elapsed = time.time() - start_time
         print(f"    Completed {progress_desc} in {elapsed:.2f} seconds ({elapsed/len(image_id_list):.2f}s per item)")
 
+class DensificationConfig:
+    """Configuration for densification process."""
+    def __init__(self):
+        self.scene_folder = ""
+        self.output_folder = ""
+        self.resolution = 518
+        self.fuse_lidar_dmaps = False
+        self.init_from_threedn_dmaps = False
+        self.use_sfm_prior = False
+        self.reference_reconstruction = None
+        self.min_track_length = 3
+        self.batch_size = 8
+        self.memory_efficient_inference = True
+        self.export_resolution = 0
+        self.conf_threshold = 0.0
+        self.max_points = 1000000
+        self.verbose = False
+        self.apache = False
+        self.smart_batching = False
+        self.sequential_batching = False
+        self.batch_size = 8
+        self.seed = 42
+
+        # runner for depth completion
+        self.run_depth_completion = None
+
+    def parse(self, args):
+        """Parse arguments into configuration."""
+        self.scene_folder = args.scene_folder
+        self.output_folder = args.output_folder if args.output_folder else os.path.join(args.scene_folder, "output")
+        self.resolution = args.resolution
+        self.fuse_lidar_dmaps = False
+        self.init_from_threedn_dmaps = False
+        self.use_sfm_prior = args.use_sfm_prior
+        self.reference_reconstruction = args.reference_reconstruction
+        self.min_track_length = args.min_track_length
+        self.batch_size = args.batch_size
+        self.memory_efficient_inference = args.memory_efficient_inference
+        self.export_resolution = args.export_resolution
+        self.conf_threshold = args.conf_threshold
+        self.max_points = args.max_points
+        self.verbose = args.verbose
+        self.apache = args.apache
+        self.smart_batching = args.smart_batching
+        self.sequential_batching = args.sequential_batching
+        self.batch_size = args.batch_size
+        self.seed = args.seed
+
 class DensificationProblem:
     """
     Densification problem class for storing depth related data for a scene.
