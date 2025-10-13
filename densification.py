@@ -22,51 +22,51 @@ class ParallelExecutor:
     """
     Generic parallel executor for running functions with image IDs in parallel.
     """
-    
+
     def __init__(self, max_workers: int = None):
         """
         Initialize the parallel executor.
-        
+
         Args:
             max_workers: Maximum number of worker threads. If None, uses CPU count.
         """
         self.max_workers = max_workers
-    
-    def run_in_parallel(self, function, image_id_list: List[int], 
-                       progress_desc: str = "Processing", 
+
+    def run_in_parallel(self, function, image_id_list: List[int],
+                       progress_desc: str = "Processing",
                        max_workers: int = None, **kwargs) -> List:
         """
         Execute a function in parallel for each image ID.
-        
+
         Args:
             function: Function to execute. Should accept (image_id, **kwargs) as arguments.
             image_id_list: List of image IDs to process.
             progress_desc: Description for the progress bar.
             max_workers: Override the default max_workers for this execution.
             **kwargs: Additional keyword arguments to pass to the function.
-            
+
         Returns:
             List of results from the function calls (in order of completion).
         """
         if not image_id_list:
             return []
-            
+
         # Determine number of workers
         workers = max_workers or self.max_workers
         if workers is None:
             workers = min(len(image_id_list), os.cpu_count() or 1)
-        
+
         print(f"    {progress_desc}: {len(image_id_list)} items using {workers} workers...")
-        
+
         results = []
-        
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_img_id = {
-                executor.submit(function, img_id, **kwargs): img_id 
+                executor.submit(function, img_id, **kwargs): img_id
                 for img_id in image_id_list
             }
-            
+
             # Process completed tasks with progress bar
             with tqdm(total=len(image_id_list), desc=progress_desc, unit="item") as pbar:
                 for future in as_completed(future_to_img_id):
@@ -79,16 +79,16 @@ class ParallelExecutor:
                         print(f'Processing item {img_id} generated an exception: {exc}')
                         results.append(None)  # Add None for failed items
                         pbar.update(1)
-        
+
         return results
-    
-    def run_in_parallel_no_return(self, function, image_id_list: List[int], 
-                                 progress_desc: str = "Processing", 
+
+    def run_in_parallel_no_return(self, function, image_id_list: List[int],
+                                 progress_desc: str = "Processing",
                                  max_workers: int = None, **kwargs) -> None:
         """
         Execute a function in parallel for each image ID without collecting results.
         More memory efficient when you don't need the return values.
-        
+
         Args:
             function: Function to execute. Should accept (image_id, **kwargs) as arguments.
             image_id_list: List of image IDs to process.
@@ -98,28 +98,28 @@ class ParallelExecutor:
         """
         if not image_id_list:
             return
-            
+
         # Determine number of workers
         workers = max_workers or self.max_workers
         if workers is None:
             workers = min(len(image_id_list), os.cpu_count() or 1)
-        
+
         print(f"    {progress_desc}: {len(image_id_list)} items using {workers} workers...")
-        
+
         import time
         start_time = time.time()
-        
+
         with ThreadPoolExecutor(max_workers=workers) as executor:
             # Submit all tasks
             future_to_img_id = {
-                executor.submit(function, img_id, **kwargs): img_id 
+                executor.submit(function, img_id, **kwargs): img_id
                 for img_id in image_id_list
             }
-            
+
             print(f"    All {len(image_id_list)} tasks submitted, waiting for completion...")
-            
+
             # Process completed tasks with progress bar
-            with tqdm(total=len(image_id_list), desc=progress_desc, unit="item", 
+            with tqdm(total=len(image_id_list), desc=progress_desc, unit="item",
                      bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}<{remaining}, {rate_fmt}]') as pbar:
                 for future in as_completed(future_to_img_id):
                     img_id = future_to_img_id[future]
@@ -129,7 +129,7 @@ class ParallelExecutor:
                     except Exception as exc:
                         print(f'Processing item {img_id} generated an exception: {exc}')
                         pbar.update(1)
-        
+
         elapsed = time.time() - start_time
         print(f"    Completed {progress_desc} in {elapsed:.2f} seconds ({elapsed/len(image_id_list):.2f}s per item)")
 
@@ -156,8 +156,8 @@ class DensificationProblem:
         'target_w'              : width of the maps
 
     """
-    
-    def __init__(self, 
+
+    def __init__(self,
                  scene_folder: str,
                  target_h: int,
                  target_w: int,
@@ -166,7 +166,7 @@ class DensificationProblem:
 
         """
         Initialize the depth data class.
-        
+
         Args:
             reconstruction: COLMAP reconstruction object
             scene_folder: Path to scene folder containing images
@@ -220,6 +220,77 @@ class DensificationProblem:
         self.active_image_ids = self.reconstruction.get_all_image_ids()
         self.source_to_target_image_id_mapping = {}
 
+    def vggt_resize_and_scale_calibration(self, K: np.ndarray, original_size: tuple, target_size: int) -> tuple:
+        """
+        Resize image and scale camera calibration using VGGT's exact logic.
+        Args:
+            camera: COLMAP camera object
+            original_size: (width, height) of original image
+            target_size: target size (518) used by VGGT
+
+        Returns:
+            new_size: (width, height) of resized image (matches VGGT)
+            scaled_K: (3, 3) scaled intrinsic matrix accounting for cropping
+            crop_offset_y: vertical offset due to center cropping (0 if no crop)
+        """
+        orig_w, orig_h = original_size
+
+        # Use VGGT's exact resizing logic from load_and_preprocess_images
+        # Step 1: Resize with width = target_size (518px)
+        new_w = target_size
+        # Calculate height maintaining aspect ratio, divisible by 14
+        resized_h = round(orig_h * (new_w / orig_w) / 14) * 14
+
+        # Step 2: Center crop height if it's larger than target_size (VGGT behavior)
+        crop_offset_y = 0
+        if resized_h > target_size:
+            crop_offset_y = (resized_h - target_size) // 2
+            final_h = target_size
+        else:
+            final_h = resized_h
+
+        # Scale intrinsic matrix accounting for resize and crop
+        scale_x = new_w / orig_w
+        scale_y = resized_h / orig_h  # Use the full resized height for scaling
+
+        scaled_K = K.copy()
+        scaled_K[0, 0] *= scale_x  # fx
+        scaled_K[1, 1] *= scale_y  # fy
+        scaled_K[0, 2] *= scale_x  # cx
+        scaled_K[1, 2] = scaled_K[1, 2] * scale_y - crop_offset_y  # cy adjusted for crop
+
+        return (new_w, final_h), scaled_K, crop_offset_y
+
+    def initialize_scaled_image(self, image_id: int) -> None:
+        depth_data = self.get_depth_data(image_id)
+        if depth_data['scaled_image'] is not None:
+            target_w = depth_data['target_w']
+            target_h = depth_data['target_h']
+            assert depth_data['scaled_image'].shape == (target_h, target_w, 3), f"Scaled image shape {depth_data['scaled_image'].shape} does not match target size {target_h}x{target_w}"
+            return
+        image_path = os.path.join(self.scene_folder, depth_data['image_name'])
+        assert os.path.exists(image_path), f"Image {image_id}: {image_path} does not exist"
+
+        image_pil = Image.open(image_path).convert('RGB')
+        original_size = image_pil.size  # (width, height)
+
+        # Resize image using VGGT's approach (resize then crop)
+        # First resize to full dimensions
+        orig_w, orig_h = original_size
+        resized_w = self.target_w
+        resized_h = round(orig_h * (resized_w / orig_w) / 14) * 14
+
+        image_resized = image_pil.resize((resized_w, resized_h), Image.Resampling.BICUBIC)
+
+        # Then center crop if needed (matching VGGT exactly)
+        if resized_h > self.target_w:
+            start_y = (resized_h - self.target_w) // 2
+            image_resized = image_resized.crop((0, start_y, resized_w, start_y + self.target_w))
+
+        image_array = np.array(image_resized)
+        depth_data['scaled_image'] = image_array
+
+
     def initialize_depth_data(self, image_id: int) -> None:
         if not self.reconstruction.has_image(image_id):
             raise ValueError(f"Image {image_id} not found in reconstruction")
@@ -227,17 +298,19 @@ class DensificationProblem:
         # Extract camera intrinsics and scale for target size
         camera = self.reconstruction.get_image_camera(image_id)
         original_width, original_height = camera.width, camera.height
-        
+
         # Get intrinsics matrix and scale it for the target resolution
         K = self.reconstruction.get_camera_calibration_matrix(image_id)
-        
+
         # Scale intrinsics for resized image
-        scale_x = self.target_w / original_width
-        scale_y = self.target_h / original_height
-        K_scaled = K.copy()
-        K_scaled[0, :] *= scale_x  # Scale fx and cx
-        K_scaled[1, :] *= scale_y  # Scale fy and cy
-            
+        # scale_x = self.target_w / original_width
+        # scale_y = self.target_h / original_height
+        # K_scaled = K.copy()
+        # K_scaled[0, :] *= scale_x  # Scale fx and cx
+        # K_scaled[1, :] *= scale_y  # Scale fy and cy
+
+        new_size, K_scaled, crop_offset_y = self.vggt_resize_and_scale_calibration(K, (original_width, original_height), self.target_w)
+
         # Get camera pose (world to camera transformation)
         pose_4x4 = np.eye(4)
         cam_from_world = self.reconstruction.get_image_cam_from_world(image_id)
@@ -258,8 +331,9 @@ class DensificationProblem:
             'camera_intrinsics': K_scaled,  # Use scaled intrinsics
             'camera_pose': pose_4x4,        # Use 4x4 cam_from_world pose matrix
             'original_intrinsics': K,       # Also save original intrinsics for reference,
-            'target_w': self.target_w,
-            'target_h': self.target_h,
+            'target_w': new_size[0],
+            'target_h': new_size[1],
+            'crop_offset_y': crop_offset_y,
             'partner_image_ids': self.find_similar_images_for_image(image_id, self.fusion_max_partners)
         }
         with self._lock:
@@ -412,7 +486,7 @@ class DensificationProblem:
 
         dmap = ThreednDepthData()
         dmap.load(os.path.join(tdn_folder, dmap_name))
-        
+
         W = dmap.depth_size[0]
         H = dmap.depth_size[1]
 
@@ -445,7 +519,7 @@ class DensificationProblem:
         save_point_cloud(pts, colors, save_path)
 
         print(f"Saved point cloud to {save_path}")
-        
+
         # match_camera = self.reconstruction.get_image_camera(image_id)
         # match_cam_from_world = self.reconstruction.get_image_cam_from_world(image_id)
         # match_R = match_cam_from_world.matrix()[:3, :3]
@@ -544,7 +618,7 @@ class DensificationProblem:
             self.initialize_scaled_image,
             self.active_image_ids,
             progress_desc="Loading and Scaling Images"
-        )            
+        )
 
 
     def initialize_with_reference(self, reference_reconstruction) -> None:
@@ -569,15 +643,15 @@ class DensificationProblem:
 
         for img_id in self.active_image_ids:
             self.initialize_depth_data(img_id)
-            # self.initialize_prior_depth_data_from_reference(img_id)
+            self.initialize_prior_depth_data_from_reference(img_id)
 
-        self.parallel_executor.run_in_parallel_no_return(
-            self.initialize_prior_depth_data_from_reference,
-            self.active_image_ids,
-            progress_desc="Initializing Prior Depth Data from Reference",
-            max_workers=4  # Reduce workers to avoid overwhelming system
-        )
-        
+        # self.parallel_executor.run_in_parallel_no_return(
+        #     self.initialize_prior_depth_data_from_reference,
+        #     self.active_image_ids,
+        #     progress_desc="Initializing Prior Depth Data from Reference",
+        #     max_workers=4  # Reduce workers to avoid overwhelming system
+        # )
+
         self.parallel_executor.run_in_parallel_no_return(
             self.initialize_scaled_image,
             self.active_image_ids,
@@ -598,30 +672,15 @@ class DensificationProblem:
         depth_data = self.get_depth_data(image_id)
         ref_image_id = self.source_to_target_image_id_mapping[image_id]
         assert ref_image_id is not None, f"No target image id found for image {image_id}"
-        
+
         prior_depth_map, depth_range = compute_image_depthmap(self.reference_reconstruction, ref_image_id, depth_data['camera_intrinsics'], depth_data['camera_pose'], depth_data['target_w'], depth_data['target_h'], min_track_length=1)
-        
+
         if prior_depth_map is None:
             print(f"Warning: No prior depth map found for image {image_id}")
         depth_data['prior_depth_map'] = prior_depth_map
         depth_data['depth_range'] = depth_range
 
-    def initialize_scaled_image(self, image_id: int) -> None:
-        depth_data = self.get_depth_data(image_id)
-        if depth_data['scaled_image'] is not None:
-            target_w = depth_data['target_w']
-            target_h = depth_data['target_h']
-            assert depth_data['scaled_image'].shape == (target_h, target_w, 3), f"Scaled image shape {depth_data['scaled_image'].shape} does not match target size {target_h}x{target_w}"
-            return
-        image_path = os.path.join(self.scene_folder, depth_data['image_name'])
-        assert os.path.exists(image_path), f"Image {image_id}: {image_path} does not exist"
-        img = Image.open(image_path)
-        if img.mode == "RGBA":
-            background = Image.new("RGBA", img.size, (255, 255, 255, 255))
-            img = Image.alpha_composite(background, img)
-        img = img.convert("RGB")
-        # Convert PIL Image to numpy array for consistent indexing
-        depth_data['scaled_image'] = np.array(img.resize((depth_data['target_w'], depth_data['target_h']), Image.Resampling.BICUBIC))
+
 
     def update_depth_data(self, image_id: int, depth_map: np.ndarray, confidence_map: np.ndarray) -> None:
         depth_data = self.get_depth_data(image_id)
@@ -689,7 +748,7 @@ class DensificationProblem:
         camera_intrinsics = depth_data['camera_intrinsics']  # (3, 3) - scaled intrinsics
         cam_from_world = depth_data['camera_pose']  # (4, 4) - camera_from_world pose
         scaled_image = depth_data['scaled_image']
-        
+
         # Filter by confidence threshold
         if conf_threshold > 0.0 and confidence_map is not None:
             valid_mask = confidence_map >= conf_threshold
@@ -712,7 +771,7 @@ class DensificationProblem:
         if np.max(depth_map_filtered) == 0:
             print(f"Warning: No valid depth values after filtering: Image Id {image_id:06d}")
             return None, None, None
-        
+
         # Compute 3D points from depth using the saved camera parameters
         pts3d, valid_mask = depthmap_to_world_frame(depth_map_filtered, camera_intrinsics, cam_from_world)
 
@@ -738,12 +797,12 @@ class DensificationProblem:
         Split image IDs into batches using COLMAP reconstruction quality metrics.
         Each batch consists of a reference image and its best partner images.
         Once images are used in a batch, they cannot be reference images for future batches.
-        
+
         Args:
             reconstruction: ColmapReconstruction object
             image_ids: List of image IDs
             batch_size: Maximum number of images per batch
-            
+
         Returns:
             List of batches, where each batch is a list of image IDs
         """
@@ -753,10 +812,10 @@ class DensificationProblem:
 
         batches = []
         used_as_reference = set()  # Images that have been used as reference images
-        
+
         # Sort image IDs for consistent processing order
         remaining_candidates = sorted(self.active_image_ids)
-        
+
         while len(used_as_reference) < len(self.active_image_ids):
 
             reference_image_id = None
@@ -764,15 +823,15 @@ class DensificationProblem:
                 if img_id not in used_as_reference:
                     reference_image_id = img_id
                     break
-            
+
             if reference_image_id is None:
                 break
 
             best_partners = self.reconstruction.find_similar_images_for_image(
-                reference_image_id, 
+                reference_image_id,
                 min_points=10,  # Lower threshold for more flexibility
             )
-            
+
             valid_partners = [pid for pid in best_partners if pid in self.active_image_ids]
             if len(valid_partners) == 0:
                 print(f"No valid partners found for image {reference_image_id}")
@@ -781,7 +840,7 @@ class DensificationProblem:
 
             # Start batch with reference image
             batch = [reference_image_id]
-            
+
             # Add best partners up to batch_size
             for partner in valid_partners:
                 if len(batch) >= batch_size:
@@ -797,22 +856,22 @@ class DensificationProblem:
                         break
                     if img_id not in batch and img_id not in used_as_reference:
                         batch.append(img_id)
-            
+
             # Mark ALL images in this batch as used (cannot be reference images anymore)
             for img_id in batch:
                 used_as_reference.add(img_id)
 
             batches.append(batch)
-            
+
         all_batched_images = set()
         for batch in batches:
             all_batched_images.update(batch)
-        
+
         remaining_unprocessed = [img_id for img_id in self.active_image_ids if img_id not in all_batched_images]
-        
+
         if remaining_unprocessed:
             batches.append(remaining_unprocessed)
-        
+
         return batches
 
     def get_batches_sequential(self, batch_size: int) -> List[List[int]]:
@@ -893,11 +952,11 @@ class DensificationProblem:
     def uvd_to_world_frame(self, image_id: int, uvd_map: np.ndarray) -> np.ndarray:
         """
         Convert uvd map to world frame.
-        
+
         Args:
             image_id: ID of the image
             uvd_map: HxWx3 array containing [u, v, depth] coordinates
-            
+
         Returns:
             xyz_map: HxWx3 array containing [x, y, z] world coordinates (0 for invalid points)
         """
@@ -1006,7 +1065,7 @@ class DensificationProblem:
             return self._export_fused_point_cloud_parallel(stepping, file_name)
         else:
             return self._export_fused_point_cloud_sequential(stepping, file_name)
-    
+
     def _export_fused_point_cloud_sequential(self, stepping: int = 1, file_name: str = "fused.ply"):
         pts_list = []
         colors_list = []
@@ -1025,7 +1084,7 @@ class DensificationProblem:
 
                 exported_mask = depth_data['exported_mask']
                 image_pts3d, valid_mask = depthmap_to_world_frame(dmap, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-                
+
                 # Remove already exported points
                 valid_mask &= ~exported_mask
 
@@ -1051,7 +1110,7 @@ class DensificationProblem:
                     if depth_data['scaled_image'] is not None:
                         simg_array = np.array(depth_data['scaled_image'], dtype=np.float32) / 255.0
                         current_colors = simg_array[valid_mask]
-                    
+
                     pts_list.append(pts3d)
                     colors_list.append(current_colors)
 
@@ -1059,41 +1118,41 @@ class DensificationProblem:
         pts = np.vstack(pts_list)
         colors = np.vstack(colors_list)
         print(f"Exported {len(pts)} points to {file_name}")
-        save_point_cloud(pts, colors, os.path.join(self.cloud_folder, file_name)) 
-           
+        save_point_cloud(pts, colors, os.path.join(self.cloud_folder, file_name))
+
     def _export_fused_point_cloud_parallel(self, stepping: int = 1, file_name: str = "fused.ply"):
         from threading import Lock
-        
+
         # Initialize exported masks
         for image_id in self.active_image_ids:
             depth_data = self.get_depth_data(image_id)
             depth_data['exported_mask'] = np.zeros_like(depth_data['depth_map'], dtype=bool)
-        
+
         # Thread-safe data collection
         pts_list = []
         colors_list = []
         data_lock = Lock()
         mask_locks = {img_id: Lock() for img_id in self.active_image_ids}
-        
+
         def process_image(image_id: int):
             """Process a single image in parallel"""
             depth_data = self.get_depth_data(image_id)
             if depth_data['fused_depth_map'] is None:
                 return None
-                
+
             dmap = depth_data['fused_depth_map']
             if dmap is None:
                 return None
-                
+
             # Get exported mask with lock
             with mask_locks[image_id]:
                 exported_mask = depth_data['exported_mask'].copy()
-                
+
             image_pts3d, valid_mask = depthmap_to_world_frame(dmap, depth_data['camera_intrinsics'], depth_data['camera_pose'])
-            
+
             # Remove already exported points
             valid_mask &= ~exported_mask
-                
+
             # Process partner images with locks to avoid race conditions (before applying stepping)
             for partner_id in depth_data['partner_image_ids']:
                 if partner_id in mask_locks:  # Only process if partner is active
@@ -1111,7 +1170,7 @@ class DensificationProblem:
                 stepping_mask = np.zeros((depth_data['target_h'], depth_data['target_w']), dtype=bool)
                 stepping_mask[::stepping, ::stepping] = True
                 valid_mask &= stepping_mask
-                            
+
             # Extract points and colors
             pts3d = image_pts3d[valid_mask]
             if len(pts3d) > 0:
@@ -1119,14 +1178,14 @@ class DensificationProblem:
                 if depth_data['scaled_image'] is not None:
                     simg_array = np.array(depth_data['scaled_image'], dtype=np.float32) / 255.0
                     current_colors = simg_array[valid_mask]
-                
+
                 # Thread-safe collection
                 with data_lock:
                     pts_list.append(pts3d)
                     colors_list.append(current_colors)
-            
+
             return len(pts3d) if len(pts3d) > 0 else 0
-        
+
         # Run in parallel
         self.parallel_executor.run_in_parallel_no_return(
             process_image,
@@ -1144,12 +1203,12 @@ class DensificationProblem:
     def compute_consistency_map_depths(self, points_3d: np.ndarray, valid_mask: np.ndarray, partner_id: int) -> np.ndarray:
         """
         Compute consistency map by projecting valid 3D points to partner camera and comparing depths.
-        
+
         Args:
             points_3d: HxWx3 array of 3D points in world coordinates
             valid_mask: HxW boolean mask indicating valid points
             partner_id: ID of partner image for consistency check
-            
+
         Returns:
             consistency_map: HxWx3 array containing [u, v, depth] where u,v are partner image coordinates (all 0.0 = invalid)
         """
@@ -1160,37 +1219,37 @@ class DensificationProblem:
 
         partner_intrinsics = partner_depth_data['camera_intrinsics']
         partner_pose = partner_depth_data['camera_pose']  # cam_from_world for partner
-        
+
         # Initialize consistency map (default to invalid [u, v, depth])
         consistency_map = np.zeros_like(points_3d, dtype=np.float32)
-        
+
         # Extract valid 3D points and their original coordinates
         valid_points_3d = points_3d[valid_mask]  # Shape: (N, 3)
         if len(valid_points_3d) == 0:
             return consistency_map
-        
+
         # Get original pixel coordinates of valid points
         valid_coords = np.where(valid_mask)  # (y_coords, x_coords)
         valid_y, valid_x = valid_coords[0], valid_coords[1]
-        
+
         # Transform 3D points to partner camera coordinates
         points_3d_homo = np.hstack([valid_points_3d, np.ones((len(valid_points_3d), 1))])
         cam_coords = (partner_pose @ points_3d_homo.T).T[:, :3]  # (N, 3)
-        
+
         # Filter points behind camera
         valid_depth_mask = cam_coords[:, 2] > 0
         if not np.any(valid_depth_mask):
             return consistency_map
-        
+
         # Keep only points with valid depth
         cam_coords = cam_coords[valid_depth_mask]
         original_y = valid_y[valid_depth_mask]
         original_x = valid_x[valid_depth_mask]
-        
+
         # Project to image coordinates
         proj_coords = (partner_intrinsics @ cam_coords.T).T
         proj_coords = proj_coords / proj_coords[:, 2:3]  # Normalize by depth
-        
+
         # Get pixel coordinates and depths
         partner_pixel_x = proj_coords[:, 0].astype(int)
         partner_pixel_y = proj_coords[:, 1].astype(int)
@@ -1203,25 +1262,25 @@ class DensificationProblem:
             (partner_pixel_x >= 0) & (partner_pixel_x < W) &
             (partner_pixel_y >= 0) & (partner_pixel_y < H)
         )
-        
+
         if not np.any(in_bounds_mask):
             return consistency_map
-        
+
         # Keep only in-bounds points
         partner_pixel_x = partner_pixel_x[in_bounds_mask]
         partner_pixel_y = partner_pixel_y[in_bounds_mask]
         projected_depths = projected_depths[in_bounds_mask]
         original_y = original_y[in_bounds_mask]
         original_x = original_x[in_bounds_mask]
-        
+
         # Get partner's depth values at projected locations
         partner_depths = partner_depth_map[partner_pixel_y, partner_pixel_x]
-        
+
         # Compare depths where partner has valid measurements
         valid_partner_mask = partner_depths > 0
         if not np.any(valid_partner_mask):
             return consistency_map
-        
+
         # Compute consistency for valid comparisons
         valid_partner_depths = partner_depths[valid_partner_mask]
         valid_projected_depths = projected_depths[valid_partner_mask]
@@ -1229,22 +1288,22 @@ class DensificationProblem:
         valid_original_x = original_x[valid_partner_mask]
         valid_partner_pixel_x = partner_pixel_x[valid_partner_mask]
         valid_partner_pixel_y = partner_pixel_y[valid_partner_mask]
-        
+
         # Compute relative depth difference
         depth_diff = np.abs(valid_partner_depths - valid_projected_depths) / np.maximum(valid_projected_depths, 1e-6)
-        
+
         # Check consistency threshold
         is_consistent = depth_diff < self.fusion_consistency_threshold
-        
+
         # Set [u, v, depth] for consistent points, [0, 0, 0] for inconsistent
         consistent_u = np.where(is_consistent, valid_partner_pixel_x, 0.0)
         consistent_v = np.where(is_consistent, valid_partner_pixel_y, 0.0)
         consistent_depths = np.where(is_consistent, valid_partner_depths, 0.0)
-        
+
         consistency_map[valid_original_y, valid_original_x, 0] = consistent_u
         consistency_map[valid_original_y, valid_original_x, 1] = consistent_v
         consistency_map[valid_original_y, valid_original_x, 2] = consistent_depths
-        
+
         return consistency_map
 
     def _save_single_result(self, image_id: int, tag: str = "") -> None:
