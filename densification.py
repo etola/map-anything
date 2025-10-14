@@ -16,8 +16,6 @@ from typing import List
 from threedn_depth_data import ThreednDepthData
 from geometric_utility import depthmap_to_world_frame, colorize_heatmap, save_point_cloud, compute_depthmap, uvd_to_world_frame
 
-
-
 class ParallelExecutor:
     """
     Generic parallel executor for running functions with image IDs in parallel.
@@ -156,6 +154,7 @@ class DensificationConfig:
         self.sequential_batching = False
         self.batch_size = 8
         self.seed = 42
+        self.device = "cuda" if (os.environ.get("CUDA_VISIBLE_DEVICES") is not None and len(os.environ.get("CUDA_VISIBLE_DEVICES")) > 0) else "cpu"
 
         # parameters for fusion
         self.fusion_max_partners = 8
@@ -188,6 +187,8 @@ class DensificationConfig:
         self.sequential_batching = args.sequential_batching
         self.batch_size = args.batch_size
         self.seed = args.seed
+        if args.device is not None:
+            self.device = args.device
 
 class DensificationProblem:
     """
@@ -726,28 +727,31 @@ class DensificationProblem:
 
     def update_depth_data(self, image_id: int, depth_map: np.ndarray, confidence_map: np.ndarray) -> None:
         depth_data = self.get_depth_data(image_id)
+
+        target_w = depth_data['target_w']
+        target_h = depth_data['target_h']
+
+        if confidence_map is not None:
+            if confidence_map.ndim == 4: # 1xHxWx1
+                confidence_map = confidence_map.squeeze(0).squeeze(-1)
+            elif confidence_map.ndim == 3: # 1xHxW
+                confidence_map = confidence_map.squeeze(0)
+            depth_data['confidence_map'] = confidence_map
+            depth_data['confidence_range'] = (np.min(confidence_map), np.max(confidence_map))
+            assert confidence_map.shape == (target_h, target_w), f"Confidence map shape {confidence_map.shape} does not match target size {target_h}x{target_w}"
+
         if depth_map.ndim == 4:
             depth_map = depth_map.squeeze(0).squeeze(-1)
         elif depth_map.ndim == 3: # 1xHxW
             depth_map = depth_map.squeeze(0)
-        if confidence_map.ndim == 4: # 1xHxWx1
-            confidence_map = confidence_map.squeeze(0).squeeze(-1)
-        elif confidence_map.ndim == 3: # 1xHxW
-            confidence_map = confidence_map.squeeze(0)
 
         depth_data['depth_map'] = depth_map
-        depth_data['confidence_map'] = confidence_map
-        depth_data['confidence_range'] = (np.min(confidence_map), np.max(confidence_map))
-
         if depth_data['point_mask'] is None:
             depth_data['point_mask'] = (depth_map > 0).astype(bool)
         else:
             depth_data['point_mask'] &= (depth_map > 0).astype(bool)
 
-        target_w = depth_data['target_w']
-        target_h = depth_data['target_h']
         assert depth_map.shape == (target_h, target_w), f"Depth map shape {depth_map.shape} does not match target size {target_h}x{target_w}"
-        assert confidence_map.shape == (target_h, target_w), f"Confidence map shape {confidence_map.shape} does not match target size {target_h}x{target_w}"
 
     def save_depth_data(self, image_id: int) -> None:
         depth_data = self.get_depth_data(image_id)
